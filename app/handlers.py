@@ -1,47 +1,27 @@
-import asyncio
-import os
-from dotenv import load_dotenv
-
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from app.keyboards import get_reply_keyboard
+from app.states import Form
+from config import Config
 
-load_dotenv()
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-
-class Form(StatesGroup):
-    name = State()
-    birthday = State()
-    text = State()
+router = Router()
 
 
-@dp.message(CommandStart())
+@router.message(CommandStart())
 async def cmd_start(message: types.Message):
-    KeyBoard = types.ReplyKeyboardMarkup(keyboard=[
-        [
-            types.KeyboardButton(text='Задать вопрос'),
-            types.KeyboardButton(text='Оставить заявку'),
-        ],
-        [
-            types.KeyboardButton(text='О нас')
-        ]
-    ], resize_keyboard=True)
+    KeyBoard = get_reply_keyboard()
 
     await message.answer(text='Привет, новый пользователь! Наш прайс: 100 рублей. Выбери один из вариантов:',
                          reply_markup=KeyBoard)
 
 
-@dp.message(Command('help'))
+@router.message(Command('help'))
 async def cmd_help(message: types.Message):
     await message.answer('Я бот для приема заявок. Скоро здесь будет меню.')
 
 
-@dp.message(F.text == 'Оставить заявку')
+@router.message(F.text == 'Оставить заявку')
 async def set_name(message: types.Message, state: FSMContext):
     await state.set_state(Form.name)
 
@@ -49,7 +29,7 @@ async def set_name(message: types.Message, state: FSMContext):
                          reply_markup=types.ReplyKeyboardRemove())
 
 
-@dp.message(Form.name)
+@router.message(Form.name)
 async def set_birthday(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(Form.birthday)
@@ -59,7 +39,7 @@ async def set_birthday(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Form.birthday)
+@router.message(Form.birthday)
 async def set_text(message: types.Message, state: FSMContext):
     await state.update_data(birthday=message.text)
     await state.set_state(Form.text)
@@ -69,25 +49,14 @@ async def set_text(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Form.text)
-async def save_statement(message: types.Message, state: FSMContext):
+@router.message(Form.text)
+async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     await state.update_data(text=message.text)
     data = await state.get_data()
 
-    print(data)
-
-    await state.clear()
-    await message.answer(
-        text='Спасибо, ваша заявка отправлена администратору. Чтобы написать еще раз, составьте новую заявку.'
+    await bot.send_message(chat_id=Config.ADMIN_ID,
+        text=f'Вам пришла новая заявка!\n{data["name"]} {data["birthday"]} года рождения говорит: {data["text"]}'
     )
-
-async def main():
-    print('Бот запускается...')
-
-    await dp.start_polling(bot)
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    await state.clear()
 
 
