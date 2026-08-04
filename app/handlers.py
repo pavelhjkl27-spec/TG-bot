@@ -17,29 +17,41 @@ router = Router()
 async def cmd_start(message: types.Message):
     keyboard = get_main_keyboard()
 
-    await message.answer(text='Привет, новый пользователь! Наш прайс: 100 рублей. Выбери один из вариантов:',
-                         reply_markup=keyboard)
+    await message.answer(text=(
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "💰 Наш текущий прайс: <b>100 рублей</b>\n\n"
+        "👇 <i>Выберите нужное действие в меню ниже:</i>"),
+        reply_markup=keyboard)
 
 
 @router.message(Command('help'))
 async def cmd_help(message: types.Message):
-    await message.answer('Я бот для приема заявок. Скоро здесь будет меню.')
+    await message.answer(text=(
+        "ℹ️ <b>Справочная информация</b>\n\n"
+        "Я бот для приема заявок и обращений. Воспользуйтесь клавиатурой внизу, чтобы начать работу.")
+    )
 
 
 @router.message(F.text == 'Оставить заявку')
 async def set_name(message: types.Message, state: FSMContext):
     await state.set_state(Form.name)
 
-    await message.answer(text='Для того, чтобы оставить заявку. введите ваше имя:',
-                         reply_markup=get_cancel_keyboard())
+    await message.answer(text=(
+        "📝 <b>Оформление заявки</b>\n\n"
+        "Пожалуйста, введите ваше <b>имя</b>:"),
+        reply_markup=get_cancel_keyboard()
+    )
 
 
 @router.message(F.text == 'Меню')
 async def menu(message: types.Message, state: FSMContext):
     await state.clear()
 
-    await message.answer(text='Вы вернулись в меню. Выберите вариант:',
-                         reply_markup=get_main_keyboard())
+    await message.answer(text=(
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "💰 Наш текущий прайс: <b>100 рублей</b>\n\n"
+        "👇 <i>Выберите нужное действие в меню ниже:</i>"),
+        reply_markup=get_main_keyboard())
 
 
 @router.message(F.text == 'Назад')
@@ -50,11 +62,15 @@ async def back(message: types.Message, state: FSMContext):
         await state.set_state(Form.birthday)
 
         await message.answer(text='Введите вашу дату рождения в формате DD/MM/YYYY:')
+
     elif current_state == Form.birthday.state:
         await state.set_state(Form.name)
 
-        await message.answer(text='Введите ваше имя:',
-                             reply_markup=get_cancel_keyboard())
+        await message.answer(text=(
+            "📝 <b>Оформление заявки</b>\n\n"
+            "Пожалуйста, введите ваше <b>имя</b>:"),
+            reply_markup=get_cancel_keyboard()
+        )
 
 @router.message(F.reply_to_message, F.from_user.id == Config.ADMIN_ID)
 async def reply_to_message(message: types.Message, bot: Bot):
@@ -71,7 +87,7 @@ async def reply_to_message(message: types.Message, bot: Bot):
 @router.message(Form.name)
 async def set_birthday(message: types.Message, state: FSMContext):
     if not message or not message.text:
-        await message.answer(text='Вы ничего не написали. Напишите ваше имя:')
+        await message.answer(text="⚠️ <i>Вы ничего не написали. Пожалуйста, введите ваше имя:</i>")
 
         return
 
@@ -79,7 +95,9 @@ async def set_birthday(message: types.Message, state: FSMContext):
     await state.set_state(Form.birthday)
 
     await message.answer(
-        text='Теперь введите вашу дату рождения в формате ...:',
+        text=(
+            "📅 Отлично! Теперь введите вашу <b>дату рождения</b>.\n\n"
+            "Используйте формат <code>ДД/ММ/ГГГГ</code> (например, <i>05/12/1984</i>):"),
         reply_markup=get_back_cancel_keyboard()
     )
 
@@ -88,8 +106,11 @@ async def set_birthday(message: types.Message, state: FSMContext):
 async def set_text(message: types.Message, state: FSMContext):
     if not message or not message.text or not re.fullmatch(
             r'^(0?[1-9]|[12][0-9]|3[01])/(0?[1-9]|1[0-2])/\d{4}$', message.text):
-        await message.answer(text='Вы ничего не написали или написали в неверном формате. '
-                                  'Необходимо написать дату вашего рождения в формате DD/MM/YYYY:')
+        await message.answer(text=(
+            "⚠️ <b>Ошибка формата</b>\n\n"
+            "Пожалуйста, введите дату строго в формате <code>ДД/ММ/ГГГГ</code>\n"
+            "<i>Пример: 05/12/1984</i>")
+        )
 
         return
 
@@ -97,7 +118,9 @@ async def set_text(message: types.Message, state: FSMContext):
     await state.set_state(Form.text)
 
     await message.answer(
-        text='Напишите ваш текст обращения:',
+        text=(
+            "✍️ <b>Текст обращения</b>\n\n"
+            "Напишите суть вашей заявки или задайте вопрос в свободной форме:"),
         reply_markup=get_back_cancel_keyboard()
     )
 
@@ -105,7 +128,7 @@ async def set_text(message: types.Message, state: FSMContext):
 @router.message(Form.text)
 async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     if not message or not message.text:
-        await message.answer(text='Вы ничего не написали. Напишите текст заявки:')
+        await message.answer(text="⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше обращение:</i>")
 
         return
 
@@ -118,14 +141,19 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
 
     await bot.send_message(chat_id=Config.ADMIN_ID,
-        text=f'🔔 Новая заявка!\n\n'
-             f'Имя: {data["name"]}\n'
-             f'Дата рождения: {data["birthday"]}\n'
-             f'Текст: {data["text"]}\n'
-             f'#id{user_id}'
-    )
+                           text=(
+                               f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+                               f"👤 <b>Имя:</b> {data['name']}\n"
+                               f"📅 <b>Дата рождения:</b> {data['birthday']}\n\n"
+                               f"💬 <b>Обращение:</b>\n"
+                               f"<i>{data['text']}</i>\n\n"
+                               f"#id{user_id}")
+                           )
     await message.answer(
-        text='Спасибо, ваша заявка отправлена администратору! Чтобы написать еще раз, составьте новую заявку',
+        text=(
+            "✅ <b>Ваша заявка успешно отправлена!</b>\n\n"
+            "Администратор ознакомится с ней и ответит вам прямо здесь.\n\n"
+            "<i>Чтобы написать еще раз, выберите действие в меню.</i>"),
         reply_markup=get_main_keyboard()
     )
     await state.clear()
