@@ -25,18 +25,17 @@ async def cmd_help(message: types.Message):
 async def set_name(message: types.Message, state: FSMContext):
     await state.set_state(Form.name)
 
-    await message.answer(text='Для того, чтобы оставить заявку. введите ваше имя:',
-                         reply_markup=types.ReplyKeyboardRemove())
+    await message.answer(text='Для того, чтобы оставить заявку. введите ваше имя:')
 
 
-@router.message(F.reply_to_message, F.from_user.id == Config.ADMIN_ID)
+@router.message(F.reply_to_message, F.from_user.id == int(Config.ADMIN_ID))
 async def reply_to_message(message: types.Message, bot: Bot):
     original_message = message.reply_to_message
 
-    if not original_message or not original_message.text or 'ID' not in original_message.text or not message.text:
+    if not original_message or not original_message.text or '#id' not in original_message.text or not message.text:
         return
 
-    user_id = int(original_message.text.split('ID: ')[-1])
+    user_id = int(original_message.text.split('id')[-1])
 
     await bot.send_message(chat_id=user_id, text=message.text)
 
@@ -76,7 +75,10 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
              f'Имя: {data["name"]}\n'
              f'Дата рождения: {data["birthday"]}\n'
              f'Текст: {data["text"]}\n'
-             f'ID: {user_id}'
+             f'#id{user_id}'
+    )
+    await message.answer(
+        text='Спасибо, ваша заявка отправлена администратору! Чтобы написать еще раз, составьте новую заявку'
     )
     await state.clear()
 
