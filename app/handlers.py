@@ -10,10 +10,10 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
-    KeyBoard = get_reply_keyboard()
+    keyboard = get_reply_keyboard()
 
     await message.answer(text='Привет, новый пользователь! Наш прайс: 100 рублей. Выбери один из вариантов:',
-                         reply_markup=KeyBoard)
+                         reply_markup=keyboard)
 
 
 @router.message(Command('help'))
@@ -27,6 +27,18 @@ async def set_name(message: types.Message, state: FSMContext):
 
     await message.answer(text='Для того, чтобы оставить заявку. введите ваше имя:',
                          reply_markup=types.ReplyKeyboardRemove())
+
+
+@router.message(F.reply_to_message, F.from_user.id == Config.ADMIN_ID)
+async def reply_to_message(message: types.Message, bot: Bot):
+    original_message = message.reply_to_message
+
+    if not original_message or not original_message.text or 'ID' not in original_message.text or not message.text:
+        return
+
+    user_id = int(original_message.text.split('ID: ')[-1])
+
+    await bot.send_message(chat_id=user_id, text=message.text)
 
 
 @router.message(Form.name)
@@ -54,8 +66,17 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     await state.update_data(text=message.text)
     data = await state.get_data()
 
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
     await bot.send_message(chat_id=Config.ADMIN_ID,
-        text=f'Вам пришла новая заявка!\n{data["name"]} {data["birthday"]} года рождения говорит: {data["text"]}'
+        text=f'🔔 Новая заявка!\n\n'
+             f'Имя: {data["name"]}\n'
+             f'Дата рождения: {data["birthday"]}\n'
+             f'Текст: {data["text"]}\n'
+             f'ID: {user_id}'
     )
     await state.clear()
 
