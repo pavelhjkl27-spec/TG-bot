@@ -89,3 +89,49 @@ async def get_user_id(message_thread_id):
         if telegram_user:
             return telegram_user.telegram_id
         return None
+
+
+async def get_group_id():
+    query = select(Settings).where(Settings.id == 1)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        setting = result.scalar_one_or_none()
+
+        if setting is None:
+            return None
+
+        if setting.group_id is None:
+            return None
+
+        return setting.group_id
+
+
+async def save_group_id(group_id):
+    query = select(Settings).where(Settings.id == 1)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        setting = result.scalar_one_or_none()
+
+        if setting is None:
+            entry = Settings(id=1, group_id=group_id)
+
+            session.add(entry)
+            await session.commit()
+
+            return True
+
+        if setting.group_id is not None:
+            if setting.group_id != group_id:
+                return False
+
+            return True
+
+        setting.group_id = group_id
+        await session.commit()
+
+        return True
+

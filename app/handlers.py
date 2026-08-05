@@ -1,7 +1,7 @@
 import re
 
 from aiogram import Router, types, F, Bot
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.fsm.context import FSMContext
 
 from app.keyboards import (get_main_keyboard,
@@ -13,7 +13,8 @@ from app.db_requests import (add_user,
                              save_user_appeal,
                              get_user_thread_id,
                              get_topic_name,
-                             set_user_thread_id, get_user_id)
+                             set_user_thread_id, get_user_id,
+                             save_group_id, get_group_id)
 
 router = Router()
 
@@ -41,6 +42,59 @@ async def cmd_help(message: types.Message):
         "ℹ️ <b>Справочная информация</b>\n\n"
         "Я бот для приема заявок и обращений. Воспользуйтесь клавиатурой внизу, чтобы начать работу.")
     )
+
+
+@router.message(Command('bind'))
+async def cmd_bind(message: types.Message):
+    user = message.from_user
+
+    if user is None:
+        return
+
+    if user.id != Config.ADMIN_ID:
+        await message.answer(text='Вы не являетесь админом этого бота, '
+                                  'поэтому его функционал вам не доступен!')
+
+        return
+
+    if not message.chat.is_forum:
+        await message.answer(text='Добавьте бота в форум/супергруппу!')
+
+        return
+
+    is_saved = await save_group_id(message.chat.id)
+
+    if not is_saved:
+        await message.answer(
+            text='Бот уже привязан к другой группе!'
+        )
+
+        return
+
+    await message.answer(text='Бот был успешно привязан к группе!')
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
+async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
+    user = event.from_user
+
+    if event.chat.type == 'private':
+        return
+
+    if user is None or user.id != Config.ADMIN_ID:
+        await bot.leave_chat(chat_id=event.chat.id)
+
+        return
+
+    if not event.chat.is_forum:
+        await bot.leave_chat(chat_id=event.chat.id)
+
+        return
+
+    group_id = await get_group_id()
+
+    if group_id is not None and group_id != event.chat.id:
+        await bot.leave_chat(chat_id=event.chat.id)
 
 
 @router.message(F.text == 'Оставить заявку')
@@ -84,9 +138,21 @@ async def back(message: types.Message, state: FSMContext):
         )
 
 @router.message(F.reply_to_message,
-                F.chat.id == Config.ADMIN_ID,
+                F.from_user.id == Config.ADMIN_ID,
                 F.message_thread_id.is_not(None))
 async def reply_to_message(message: types.Message, bot: Bot):
+    group_id = await get_group_id()
+
+    if group_id is None:
+        await message.answer(text='Бот не привязан к группе!')
+
+        return
+
+    if group_id != message.chat.id:
+        await message.answer(text='Бот привязан к другой группе!')
+
+        return
+
     original_message = message.reply_to_message
 
     if not original_message or not original_message.text or not message.text:
@@ -163,6 +229,13 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     if not user:
         return
 
+    group_id = await get_group_id()
+
+    if group_id is None:
+        await message.answer(text='Бот временно не работает, попробуйте позже.')
+
+        return
+
     result = await save_user_appeal(user.id, message.text)
 
     if result == 'ERROR':
@@ -177,12 +250,12 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     if topic_id is None:
         topic_name = await get_topic_name(user.id)
 
-        topic = await bot.create_forum_topic(chat_id=Config.ADMIN_ID, name=topic_name)
+        topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
         topic_id = topic.message_thread_id
 
         await set_user_thread_id(user.id, topic_id)
 
-    await bot.send_message(chat_id=Config.ADMIN_ID,
+    await bot.send_message(chat_id=group_id,
                             text=(
                                 f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
                                 f"👤 <b>Имя:</b> {data['name']}\n"

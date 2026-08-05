@@ -1,5 +1,5 @@
 from app.database import Base
-from sqlalchemy import Column, Integer, String, DateTime, BigInteger, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, BigInteger, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 
@@ -29,5 +29,5 @@ class Settings(Base):
     __tablename__ = 'settings'
 
     id = Column(Integer, primary_key=True)
-    price = Column(Integer, nullable=False)
-    admin_topic_id = Column(Integer, nullable=False, unique=True)
+    price_text = Column(Text, nullable=False, default='Прайс уточняется у администратора')
+    group_id = Column(BigInteger, nullable=True, unique=True)
