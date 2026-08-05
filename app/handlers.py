@@ -9,6 +9,7 @@ from app.keyboards import (get_main_keyboard,
                            get_back_cancel_keyboard,)
 from app.states import Form
 from config import Config
+from app.db_requests import add_user, save_user_appeal
 
 router = Router()
 
@@ -16,6 +17,12 @@ router = Router()
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
     keyboard = get_main_keyboard()
+    user = message.from_user
+
+    if not message or not user:
+        return
+
+    await add_user(user.id)
 
     await message.answer(text=(
         "👋 <b>Добро пожаловать!</b>\n\n"
@@ -135,10 +142,19 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     await state.update_data(text=message.text)
     data = await state.get_data()
 
-    if not message.from_user:
+    user = message.from_user
+
+    if not user:
         return
 
-    user_id = message.from_user.id
+    result = await save_user_appeal(user.id, message.text)
+
+    if result == 'ERROR':
+        await message.answer(
+            text='Произошла ошибка на стороне сервер. Пожалуйста, напишите \\start'
+        )
+        
+        return
 
     await bot.send_message(chat_id=Config.ADMIN_ID,
                            text=(
@@ -147,7 +163,7 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
                                f"📅 <b>Дата рождения:</b> {data['birthday']}\n\n"
                                f"💬 <b>Обращение:</b>\n"
                                f"<i>{data['text']}</i>\n\n"
-                               f"#id{user_id}")
+                               f"#id{user.id}")
                            )
     await message.answer(
         text=(
