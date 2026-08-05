@@ -39,3 +39,53 @@ async def save_user_appeal(user_id, message):
         session.add(entry)
         await session.commit()
 
+
+async def get_user_thread_id(user_id):
+    query = select(Users).where(Users.telegram_id == user_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        telegram_user = result.scalar_one_or_none()
+
+    if telegram_user.topic_id is None:
+        return None
+
+    return telegram_user.topic_id
+
+
+async def get_topic_name(user_id):
+    query = select(Users).where(Users.telegram_id == user_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        telegram_user = result.scalar_one_or_none()
+
+
+
+    return f'Клиент №{telegram_user.id}'
+
+
+async def set_user_thread_id(user_id, topic_id):
+    query = select(Users).where(Users.telegram_id == user_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+        telegram_user = result.scalar_one_or_none()
+        telegram_user.topic_id = topic_id
+
+        await session.commit()
+
+
+async def get_user_id(message_thread_id):
+    query = select(Users).where(Users.topic_id == message_thread_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        telegram_user = result.scalar_one_or_none()
+
+        if telegram_user:
+            return telegram_user.telegram_id
+        return None

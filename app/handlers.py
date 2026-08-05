@@ -9,7 +9,11 @@ from app.keyboards import (get_main_keyboard,
                            get_back_cancel_keyboard,)
 from app.states import Form
 from config import Config
-from app.db_requests import add_user, save_user_appeal
+from app.db_requests import (add_user,
+                             save_user_appeal,
+                             get_user_thread_id,
+                             get_topic_name,
+                             set_user_thread_id, get_user_id)
 
 router = Router()
 
@@ -79,16 +83,28 @@ async def back(message: types.Message, state: FSMContext):
             reply_markup=get_cancel_keyboard()
         )
 
-@router.message(F.reply_to_message, F.from_user.id == Config.ADMIN_ID)
+@router.message(F.reply_to_message,
+                F.chat.id == Config.ADMIN_ID,
+                F.message_thread_id.is_not(None))
 async def reply_to_message(message: types.Message, bot: Bot):
     original_message = message.reply_to_message
 
-    if not original_message or not original_message.text or '#id' not in original_message.text or not message.text:
+    if not original_message or not original_message.text or not message.text:
         return
 
-    user_id = int(original_message.text.split('id')[-1])
+    user_id = await get_user_id(message.message_thread_id)
 
-    await bot.send_message(chat_id=user_id, text=message.text)
+    if not user_id:
+        return
+
+    reply_text = (
+        f"📩 <b>Ответ на вашу заявку:</b>\n"
+        f"<i>{original_message.text}</i>\n\n"
+        f"💬 <b>Сообщение от администратора:</b>\n"
+        f"{message.text}"
+    )
+
+    await bot.send_message(chat_id=user_id, text=reply_text)
 
 
 @router.message(Form.name)
@@ -153,18 +169,29 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         await message.answer(
             text='Произошла ошибка на стороне сервер. Пожалуйста, напишите \\start'
         )
-        
+
         return
 
+    topic_id = await get_user_thread_id(user.id)
+
+    if topic_id is None:
+        topic_name = await get_topic_name(user.id)
+
+        topic = await bot.create_forum_topic(chat_id=Config.ADMIN_ID, name=topic_name)
+        topic_id = topic.message_thread_id
+
+        await set_user_thread_id(user.id, topic_id)
+
     await bot.send_message(chat_id=Config.ADMIN_ID,
-                           text=(
-                               f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
-                               f"👤 <b>Имя:</b> {data['name']}\n"
-                               f"📅 <b>Дата рождения:</b> {data['birthday']}\n\n"
-                               f"💬 <b>Обращение:</b>\n"
-                               f"<i>{data['text']}</i>\n\n"
-                               f"#id{user.id}")
-                           )
+                            text=(
+                                f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+                                f"👤 <b>Имя:</b> {data['name']}\n"
+                                f"📅 <b>Дата рождения:</b> {data['birthday']}\n\n"
+                                f"💬 <b>Обращение:</b>\n"
+                                f"<i>{data['text']}</i>"),
+                            message_thread_id=topic_id
+                            )
+
     await message.answer(
         text=(
             "✅ <b>Ваша заявка успешно отправлена!</b>\n\n"
