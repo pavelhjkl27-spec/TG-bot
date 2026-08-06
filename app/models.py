@@ -30,4 +30,5 @@ class Settings(Base):
 
     id = Column(Integer, primary_key=True)
     price_text = Column(Text, nullable=False, default='Прайс уточняется у администратора')
+    about_us_text = Column(Text, nullable=False, default='Описание уточняется у администратора')
     group_id = Column(BigInteger, nullable=True, unique=True)

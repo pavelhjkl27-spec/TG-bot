@@ -16,7 +16,7 @@ async def add_user(user_id):
             await session.rollback()
 
 
-async def save_user_appeal(user_id, message):
+async def save_user_appeal(user_id, message, appeal_type):
     query = select(Users).where(
         Users.telegram_id == user_id
     )
@@ -31,7 +31,7 @@ async def save_user_appeal(user_id, message):
 
         entry = Requests(
             user_id=telegram_user.id,
-            type='Bid',
+            type=appeal_type,
             text=message
         )
 
@@ -146,3 +146,19 @@ async def save_group_id(group_id):
 
         return True
 
+
+async def get_about_us():
+    query = select(Settings).where(Settings.id == 1)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        setting = result.scalar_one_or_none()
+
+        if setting is None:
+            return None
+
+        if setting.about_us_text is None:
+            return None
+
+        return setting.about_us_text

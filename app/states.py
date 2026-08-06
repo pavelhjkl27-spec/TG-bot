@@ -5,3 +5,7 @@ class Form(StatesGroup):
     name = State()
     birthday = State()
     text = State()
+
+class Question(StatesGroup):
+    question = State()
+

@@ -36,3 +36,19 @@ def get_back_cancel_keyboard():
     ], resize_keyboard=True)
 
     return keyboard
+
+
+def get_admin_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                types.KeyboardButton(text='Сделать рассылку'),
+                types.KeyboardButton(text='Как пользоваться ботом?')
+            ],
+            [
+                types.KeyboardButton(text='Изменить "О нас"')
+            ],
+        ]
+    )
+
+    return keyboard
