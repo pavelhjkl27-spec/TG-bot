@@ -5,7 +5,8 @@ from sqlalchemy import select
 
 
 async def add_user(user_id):
-    entry = Users(telegram_id=user_id)
+    entry = Users(telegram_id=user_id, is_active=True)
+    query = select(Users).where(Users.telegram_id == user_id)
 
     async with async_session_maker() as session:
         try:
@@ -14,6 +15,15 @@ async def add_user(user_id):
 
         except IntegrityError:
             await session.rollback()
+
+            result = await session.execute(query)
+
+            telegram_user = result.scalar_one_or_none()
+            telegram_user.is_active = True
+
+            await session.commit()
+
+
 
 
 async def save_user_appeal(user_id, message, appeal_type):
@@ -162,3 +172,53 @@ async def get_about_us():
             return None
 
         return setting.about_us_text
+
+
+async def get_users():
+    query = select(Users.telegram_id, Users.is_active)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        telegram_users = result.all()
+
+        if not telegram_users:
+            return None
+
+        return telegram_users
+
+
+async def activated_user(user_id):
+    query = select(Users).where(Users.telegram_id == user_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        telegram_user = result.scalar_one_or_none()
+
+        if telegram_user is None:
+            return False
+
+        telegram_user.is_active = True
+
+        await session.commit()
+
+        return True
+
+
+async def deactivated_user(user_id):
+    query = select(Users).where(Users.telegram_id == user_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        telegram_user = result.scalar_one_or_none()
+
+        if telegram_user is None:
+            return False
+
+        telegram_user.is_active = False
+
+        await session.commit()
+
+        return True

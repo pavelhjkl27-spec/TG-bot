@@ -1,5 +1,8 @@
 from app.database import Base
-from sqlalchemy import Column, Integer, String, DateTime, BigInteger, ForeignKey, Text
+from sqlalchemy import (Column, Integer,
+                        String, DateTime,
+                        BigInteger, ForeignKey,
+                        Text, Boolean)
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 
@@ -9,6 +12,7 @@ class Users(Base):
     id = Column(Integer, primary_key=True)
     telegram_id = Column(BigInteger, nullable=False, unique=True)
     topic_id = Column(Integer, unique=True, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
 
     requests = relationship("Requests", back_populates="user")
 

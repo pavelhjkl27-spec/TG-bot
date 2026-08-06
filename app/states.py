@@ -6,6 +6,10 @@ class Form(StatesGroup):
     birthday = State()
     text = State()
 
+
 class Question(StatesGroup):
     question = State()
 
+
+class Newsletter(StatesGroup):
+    text = State()
