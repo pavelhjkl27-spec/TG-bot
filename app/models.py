@@ -19,7 +19,7 @@ class Requests(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     type = Column(String(20), nullable=False)
-    text = Column(String(1000), nullable=False)
+    text = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda _: datetime.now(timezone.utc))
 
     user = relationship('Users', back_populates='requests')

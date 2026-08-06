@@ -27,17 +27,18 @@ async def save_user_appeal(user_id, message):
         telegram_user = result.scalar()
 
         if not telegram_user:
-            return 'ERROR'
+            return False
 
-    entry = Requests(
-        user_id=telegram_user.id,
-        type='Bid',
-        text=message
-    )
+        entry = Requests(
+            user_id=telegram_user.id,
+            type='Bid',
+            text=message
+        )
 
-    async with async_session_maker() as session:
         session.add(entry)
         await session.commit()
+
+        return True
 
 
 async def get_user_thread_id(user_id):
@@ -47,6 +48,9 @@ async def get_user_thread_id(user_id):
         result = await session.execute(query)
 
         telegram_user = result.scalar_one_or_none()
+
+        if telegram_user is None:
+            return None
 
     if telegram_user.topic_id is None:
         return None
@@ -62,7 +66,8 @@ async def get_topic_name(user_id):
 
         telegram_user = result.scalar_one_or_none()
 
-
+        if telegram_user is None:
+            return None
 
     return f'Клиент №{telegram_user.id}'
 
@@ -73,9 +78,15 @@ async def set_user_thread_id(user_id, topic_id):
     async with async_session_maker() as session:
         result = await session.execute(query)
         telegram_user = result.scalar_one_or_none()
+
+        if telegram_user is None:
+            return False
+
         telegram_user.topic_id = topic_id
 
         await session.commit()
+
+        return True
 
 
 async def get_user_id(message_thread_id):

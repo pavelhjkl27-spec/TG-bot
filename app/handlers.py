@@ -3,6 +3,7 @@ import re
 from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
@@ -19,8 +20,10 @@ from app.db_requests import (add_user,
 router = Router()
 
 
-@router.message(CommandStart())
-async def cmd_start(message: types.Message):
+@router.message(CommandStart(), F.chat.type == 'private')
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+
     keyboard = get_main_keyboard()
     user = message.from_user
 
@@ -36,7 +39,7 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard)
 
 
-@router.message(Command('help'))
+@router.message(Command('help'), F.chat.type == 'private')
 async def cmd_help(message: types.Message):
     await message.answer(text=(
         "ℹ️ <b>Справочная информация</b>\n\n"
@@ -45,29 +48,43 @@ async def cmd_help(message: types.Message):
 
 
 @router.message(Command('bind'))
-async def cmd_bind(message: types.Message):
+async def cmd_bind(message: types.Message, bot: Bot):
     user = message.from_user
 
     if user is None:
         return
 
+    if message.chat.type == 'private':
+        await message.answer(text='Вы не можете выполнить это действие здесь!')
+
+        return
+
     if user.id != Config.ADMIN_ID:
-        await message.answer(text='Вы не являетесь админом этого бота, '
-                                  'поэтому его функционал вам не доступен!')
+        try:
+            await message.answer(text='Вы не являетесь админом этого бота, '
+                                    'поэтому его функционал вам не доступен!')
+        except TelegramBadRequest:
+            pass
 
         return
 
     if not message.chat.is_forum:
-        await message.answer(text='Добавьте бота в форум/супергруппу!')
+        try:
+            await message.answer(text='Добавьте бота в форум/супергруппу!')
+        except TelegramBadRequest:
+            pass
 
         return
 
     is_saved = await save_group_id(message.chat.id)
 
     if not is_saved:
-        await message.answer(
-            text='Бот уже привязан к другой группе!'
-        )
+        try:
+            await message.answer(
+                text='Бот уже привязан к другой группе!'
+            )
+        except TelegramBadRequest:
+            pass
 
         return
 
@@ -87,17 +104,32 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
         return
 
     if not event.chat.is_forum:
-        await bot.leave_chat(chat_id=event.chat.id)
+        try:
+            await bot.send_message(chat_id=event.chat.id, text='Включите темы в группе!')
+        except TelegramBadRequest:
+            pass
+        finally:
+            await bot.leave_chat(chat_id=event.chat.id)
 
         return
 
     group_id = await get_group_id()
 
     if group_id is not None and group_id != event.chat.id:
-        await bot.leave_chat(chat_id=event.chat.id)
+        try:
+            await bot.send_message(chat_id=event.chat.id, text='Бот уже привязан к другой группе!')
+        except TelegramBadRequest:
+            pass
+        finally:
+            await bot.leave_chat(chat_id=event.chat.id)
+
+        return
+
+    if event.chat.id != group_id:
+        await bot.send_message(chat_id=event.chat.id, text='Используйте команду /bind, чтобы привязать бота к этой группе.')
 
 
-@router.message(F.text == 'Оставить заявку')
+@router.message(F.text == 'Оставить заявку', F.chat.type == 'private')
 async def set_name(message: types.Message, state: FSMContext):
     await state.set_state(Form.name)
 
@@ -108,7 +140,7 @@ async def set_name(message: types.Message, state: FSMContext):
     )
 
 
-@router.message(F.text == 'Меню')
+@router.message(F.text == 'Меню', F.chat.type == 'private')
 async def menu(message: types.Message, state: FSMContext):
     await state.clear()
 
@@ -119,9 +151,19 @@ async def menu(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard())
 
 
-@router.message(F.text == 'Назад')
+@router.message(F.text == 'Назад', F.chat.type == 'private')
 async def back(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
+
+    if current_state is None:
+        await message.answer(text=(
+            "👋 <b>Добро пожаловать!</b>\n\n"
+            "💰 Наш текущий прайс: <b>100 рублей</b>\n\n"
+            "👇 <i>Выберите нужное действие в меню ниже:</i>"),
+            reply_markup=get_main_keyboard()
+        )
+
+        return
 
     if current_state == Form.text.state:
         await state.set_state(Form.birthday)
@@ -144,12 +186,18 @@ async def reply_to_message(message: types.Message, bot: Bot):
     group_id = await get_group_id()
 
     if group_id is None:
-        await message.answer(text='Бот не привязан к группе!')
+        try:
+            await message.answer(text='Бот не привязан к группе!')
+        except TelegramBadRequest:
+            pass
 
         return
 
     if group_id != message.chat.id:
-        await message.answer(text='Бот привязан к другой группе!')
+        try:
+            await message.answer(text='Бот привязан к другой группе!')
+        except TelegramBadRequest:
+            pass
 
         return
 
@@ -161,6 +209,11 @@ async def reply_to_message(message: types.Message, bot: Bot):
     user_id = await get_user_id(message.message_thread_id)
 
     if not user_id:
+        try:
+            await message.answer(text='Данный пользователь не зарегистрирован в боте!')
+        except TelegramBadRequest:
+            pass
+
         return
 
     reply_text = (
@@ -170,10 +223,13 @@ async def reply_to_message(message: types.Message, bot: Bot):
         f"{message.text}"
     )
 
-    await bot.send_message(chat_id=user_id, text=reply_text)
+    try:
+        await bot.send_message(chat_id=user_id, text=reply_text)
+    except TelegramForbiddenError:
+        await message.answer(text='Пользователь только что заблокировал бота, поэтому ваше сообщение не доставлено.')
 
 
-@router.message(Form.name)
+@router.message(Form.name, F.chat.type == 'private')
 async def set_birthday(message: types.Message, state: FSMContext):
     if not message or not message.text:
         await message.answer(text="⚠️ <i>Вы ничего не написали. Пожалуйста, введите ваше имя:</i>")
@@ -191,7 +247,7 @@ async def set_birthday(message: types.Message, state: FSMContext):
     )
 
 
-@router.message(Form.birthday)
+@router.message(Form.birthday, F.chat.type == 'private')
 async def set_text(message: types.Message, state: FSMContext):
     if not message or not message.text or not re.fullmatch(
             r'^(0?[1-9]|[12][0-9]|3[01])/(0?[1-9]|1[0-2])/\d{4}$', message.text):
@@ -214,7 +270,7 @@ async def set_text(message: types.Message, state: FSMContext):
     )
 
 
-@router.message(Form.text)
+@router.message(Form.text, F.chat.type == 'private')
 async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     if not message or not message.text:
         await message.answer(text="⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше обращение:</i>")
@@ -223,6 +279,8 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
 
     await state.update_data(text=message.text)
     data = await state.get_data()
+
+    await state.clear()
 
     user = message.from_user
 
@@ -236,34 +294,61 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
 
         return
 
-    result = await save_user_appeal(user.id, message.text)
-
-    if result == 'ERROR':
-        await message.answer(
-            text='Произошла ошибка на стороне сервер. Пожалуйста, напишите \\start'
-        )
-
-        return
-
     topic_id = await get_user_thread_id(user.id)
 
     if topic_id is None:
         topic_name = await get_topic_name(user.id)
 
-        topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
+        if topic_name is None:
+            try:
+                await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
+            except TelegramBadRequest:
+                pass
+
+            return
+
+        try:
+            topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
+        except TelegramBadRequest:
+            await message.answer(text='Ошибка на стороне сервера. Попробуйте создать заявку позже.')
+
+            return
+
         topic_id = topic.message_thread_id
 
-        await set_user_thread_id(user.id, topic_id)
+        status = await set_user_thread_id(user.id, topic_id)
 
-    await bot.send_message(chat_id=group_id,
-                            text=(
-                                f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
-                                f"👤 <b>Имя:</b> {data['name']}\n"
-                                f"📅 <b>Дата рождения:</b> {data['birthday']}\n\n"
-                                f"💬 <b>Обращение:</b>\n"
-                                f"<i>{data['text']}</i>"),
-                            message_thread_id=topic_id
-                            )
+        if not status:
+            await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
+
+            return
+
+    try:
+        await bot.send_message(chat_id=group_id,
+                                text=(
+                                    f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+                                    f"👤 <b>Имя:</b> {data['name']}\n"
+                                    f"📅 <b>Дата рождения:</b> {data['birthday']}\n\n"
+                                    f"💬 <b>Обращение:</b>\n"
+                                    f"<i>{data['text']}</i>"),
+                                message_thread_id=topic_id
+                                )
+    except TelegramBadRequest:
+        await message.answer(text='Ваша заявка не была доставлена. Ошибка на сервере.')
+
+        return
+
+    result = await save_user_appeal(user.id, message.text)
+
+    if not result:
+        try:
+            await message.answer(
+                text='Произошла ошибка на стороне сервер. Пожалуйста, напишите \\start'
+            )
+        except TelegramBadRequest:
+            pass
+
+        return
 
     await message.answer(
         text=(
@@ -272,6 +357,5 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
             "<i>Чтобы написать еще раз, выберите действие в меню.</i>"),
         reply_markup=get_main_keyboard()
     )
-    await state.clear()
 
 
