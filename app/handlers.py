@@ -1,15 +1,16 @@
 import re
 import html
+import asyncio
 
 from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
 from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
-                           get_admin_keyboard)
+                           get_admin_keyboard, get_sure_keyboard)
 from app.states import Form, Question, Newsletter
 from config import Config
 from app.db_requests import (add_user,
@@ -240,6 +241,21 @@ async def question_text(message: types.Message, state: FSMContext):
         pass
 
 
+@router.message(F.text == 'Сделать рассылку',
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def newsletter(message: types.Message, state: FSMContext):
+    await state.set_state(Newsletter.text)
+
+    try:
+        await message.answer(
+            text='Введите текст рассылки:',
+            reply_markup=get_cancel_keyboard()
+        )
+    except TelegramForbiddenError:
+        pass
+
+
 @router.message(F.text == 'Меню', F.chat.type == 'private')
 async def menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -265,7 +281,6 @@ async def menu(message: types.Message, state: FSMContext):
         await message.answer(text='Вы в меню.', reply_markup=get_admin_keyboard())
     except TelegramForbiddenError:
         pass
-
 
 
 @router.message(F.text == 'Назад', F.chat.type == 'private')
@@ -296,20 +311,6 @@ async def back(message: types.Message, state: FSMContext):
             reply_markup=get_cancel_keyboard()
         )
 
-
-@router.message(F.text == 'Сделать рассылку',
-                F.chat.type == 'private',
-                F.from_user.id == Config.ADMIN_ID)
-async def newsletter(message: types.Message, bot: Bot, state: FSMContext):
-    await state.set_state(Newsletter.text)
-
-    try:
-        await message.answer(
-            text='Введите текст рассылки:',
-            reply_markup=get_cancel_keyboard()
-        )
-    except TelegramForbiddenError:
-        pass
 
 @router.message(F.reply_to_message,
                 F.from_user.id == Config.ADMIN_ID,
@@ -601,66 +602,109 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
 @router.message(Newsletter.text,
                 F.chat.type == 'private',
                 F.from_user.id == Config.ADMIN_ID)
-async def send_newsletter(message: types.Message, state: FSMContext, bot: Bot):
+async def send_newsletter(message: types.Message, state: FSMContext):
     if not message or not message.text:
         try:
-            await message.answer(text='Текст не распознан. Пожалуйста, напишите рассылку снова.')
+            await message.answer(text='Текст не распознан. Пожалуйста, напишите текст снова.')
+        except TelegramForbiddenError:
+            pass
+
+        return
+
+    if len(message.text) > 4096:
+        try:
+            await message.answer(text='Ваше сообщение слишком длинное! Пожалуйста, учтите ограничение в 4096 символов.')
         except TelegramForbiddenError:
             pass
 
         return
 
     await state.update_data(newsletter=message.text)
-    data = await state.get_data()
-
-    await state.clear()
-
-    group_id = await get_group_id()
-
-    if group_id is None:
-        try:
-            await message.answer(text='Бот не привязан к группе. Вы не можете сделать рассылку!')
-        except TelegramForbiddenError:
-            pass
-
-        return
-
-    users = await get_users()
-
-    if users is None:
-        try:
-            await  message.answer(text='У бота нету пользователей. Пока что сделать рассылку нельзя.')
-        except TelegramForbiddenError:
-            pass
-
-        return
-
-    sent = 0
-    not_sent = 0
-
-    for telegram_id, is_active in users:
-        if is_active:
-            try:
-                await bot.send_message(chat_id=telegram_id,
-                                       text=html.escape(data['newsletter']))
-                sent += 1
-            except TelegramForbiddenError:
-                not_sent += 1
-
-                await deactivated_user(telegram_id)
-            except TelegramBadRequest:
-                not_sent += 1
+    await state.set_state(Newsletter.sure)
 
     try:
-        await message.answer(
-            text=f'Рассылка завершена\n\n'
-                 f'Отправлено: {sent}\n'
-                 f'Не отправлено: {not_sent}\n\n'
-                 f'Всего человек: {len(users)}\n'
-                 f'Активных из них: {sent + not_sent}'
-        )
+        await message.answer(text=f'Вы уверены?\n\n'
+                                  f'Вот так выглядит ваше сообщение сейчас:\n',
+                             reply_markup=get_sure_keyboard())
+        await message.answer(text=f'{html.escape(message.text)}')
     except TelegramForbiddenError:
         pass
 
 
+@router.message(Newsletter.sure,
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot):
+    if not message or not message.text or message.text not in ['Подтвердить', 'Изменить']:
+        try:
+            await message.answer(text='Такого варианта нету!')
+        except TelegramForbiddenError:
+            pass
 
+        return
+
+    elif message.text == 'Подтвердить':
+        data = await state.get_data()
+        await state.clear()
+
+        users = await get_users()
+
+        if users is None:
+            try:
+                await  message.answer(text='У бота нету пользователей. Пока что сделать рассылку нельзя.',
+                                      reply_markup=get_admin_keyboard())
+            except TelegramForbiddenError:
+                pass
+
+            return
+
+        sent = 0
+        not_sent = 0
+
+        for telegram_id, is_active in users:
+            if is_active:
+                while True:
+                    try:
+                        await bot.send_message(chat_id=telegram_id,
+                                               text=html.escape(data['newsletter']))
+                        sent += 1
+
+                        break
+                    except TelegramForbiddenError:
+                        not_sent += 1
+                        await deactivated_user(telegram_id)
+
+                        break
+                    except TelegramBadRequest:
+                        not_sent += 1
+
+                        break
+                    except TelegramRetryAfter as error:
+                        await asyncio.sleep(error.retry_after)
+
+        try:
+            await message.answer(
+                text=f'Рассылка завершена\n\n'
+                     f'Отправлено: {sent}\n'
+                     f'Не отправлено: {not_sent}\n\n'
+                     f'Всего человек: {len(users)}\n'
+                     f'Активных из них: {sent + not_sent}',
+                reply_markup=get_admin_keyboard()
+            )
+        except TelegramForbiddenError:
+            pass
+
+        return
+
+    elif message.text == 'Изменить':
+        await state.set_state(Newsletter.text)
+
+        try:
+            await message.answer(
+                text='Введите текст рассылки:',
+                reply_markup=get_cancel_keyboard()
+            )
+        except TelegramForbiddenError:
+            pass
+
+        return

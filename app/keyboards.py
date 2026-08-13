@@ -52,3 +52,13 @@ def get_admin_keyboard():
     )
 
     return keyboard
+
+
+def get_sure_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text='Подтвердить'), types.KeyboardButton(text='Изменить')]
+        ], resize_keyboard=True, one_time_keyboard=True
+    )
+
+    return keyboard

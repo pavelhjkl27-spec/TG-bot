@@ -13,3 +13,5 @@ class Question(StatesGroup):
 
 class Newsletter(StatesGroup):
     text = State()
+    sure = State()
+
