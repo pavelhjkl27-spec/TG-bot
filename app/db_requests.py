@@ -222,3 +222,25 @@ async def deactivated_user(user_id):
         await session.commit()
 
         return True
+
+
+async def set_about_us_text(about_us_text):
+    query = select(Settings).where(Settings.id == 1)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        setting = result.scalar_one_or_none()
+
+        if setting is None:
+            entry = Settings(id=1, group_id=None, about_us_text=about_us_text)
+
+            session.add(entry)
+            await session.commit()
+
+            return True
+
+        setting.about_us_text = about_us_text
+        await session.commit()
+
+        return True

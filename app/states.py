@@ -15,3 +15,6 @@ class Newsletter(StatesGroup):
     text = State()
     sure = State()
 
+
+class ChangeAboutUs(StatesGroup):
+    about_us_text = State()

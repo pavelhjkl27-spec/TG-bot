@@ -11,7 +11,7 @@ from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
                            get_admin_keyboard, get_sure_keyboard)
-from app.states import Form, Question, Newsletter
+from app.states import Form, Question, Newsletter, ChangeAboutUs
 from config import Config
 from app.db_requests import (add_user,
                              save_user_appeal,
@@ -20,7 +20,8 @@ from app.db_requests import (add_user,
                              set_user_thread_id, get_user_id,
                              save_group_id, get_group_id,
                              get_about_us, get_users,
-                             activated_user, deactivated_user)
+                             activated_user, deactivated_user,
+                             set_about_us_text)
 
 router = Router()
 
@@ -252,6 +253,18 @@ async def newsletter(message: types.Message, state: FSMContext):
             text='Введите текст рассылки:',
             reply_markup=get_cancel_keyboard()
         )
+    except TelegramForbiddenError:
+        pass
+
+
+@router.message(F.text == 'Изменить "О нас"',
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def change_about_us(message: types.Message, state: FSMContext):
+    await state.set_state(ChangeAboutUs.about_us_text)
+
+    try:
+        await message.answer(text='Напишите описание вашего сервиса и предоставляемых вами услуг:')
     except TelegramForbiddenError:
         pass
 
@@ -708,3 +721,37 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
             pass
 
         return
+
+
+@router.message(ChangeAboutUs.about_us_text,
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def set_about_us(message: types.Message, state: FSMContext):
+    if not message or not message.text:
+        try:
+            await message.answer(text='⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше описание:</i>')
+        except TelegramForbiddenError:
+            pass
+
+        return
+
+    await state.update_data(about_us=message.text)
+    data = await state.get_data()
+
+    await state.clear()
+
+    status = await set_about_us_text(data['about_us'])
+
+    if not status:
+        try:
+            await message.answer(text='Текст не был сохранен! Пожалуйста, попробуйте снова.')
+        except TelegramForbiddenError:
+            pass
+
+        return
+
+    try:
+        await message.answer(text='Текст был успешно изменен!',
+                             reply_markup=get_admin_keyboard())
+    except TelegramForbiddenError:
+        pass
