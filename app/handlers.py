@@ -11,7 +11,7 @@ from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
                            get_admin_keyboard, get_sure_keyboard)
-from app.states import Form, Question, Newsletter, ChangeAboutUs
+from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice
 from config import Config
 from app.db_requests import (add_user,
                              save_user_appeal,
@@ -21,7 +21,8 @@ from app.db_requests import (add_user,
                              save_group_id, get_group_id,
                              get_about_us, get_users,
                              activated_user, deactivated_user,
-                             set_about_us_text)
+                             set_about_us_text, get_price,
+                             set_price)
 
 router = Router()
 
@@ -41,11 +42,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
         await add_user(user.id)
 
+        price = await get_price()
+
+        if price is None:
+            price = 'Прайс уточняется у администратора.'
+
         try:
             await message.answer(text=(
-                "👋 <b>Добро пожаловать!</b>\n\n"
-                "💰 Наш текущий прайс: <b>100 рублей</b>\n\n"
-                "👇 <i>Выберите нужное действие в меню ниже:</i>"),
+                f"👋 <b>Добро пожаловать!</b>\n\n"
+                f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
+                f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
                 reply_markup=keyboard)
         except TelegramForbiddenError:
             pass
@@ -269,6 +275,85 @@ async def change_about_us(message: types.Message, state: FSMContext):
         pass
 
 
+@router.message(F.text == 'Изменить прайс',
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def change_price(message: types.Message, state: FSMContext):
+    await state.set_state(ChangePrice.price)
+
+    try:
+        await message.answer(text='Напишите ваш прайс:')
+    except TelegramForbiddenError:
+        pass
+
+
+@router.message(F.text == 'Как пользоваться ботом?',
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def admin_instruction(message: types.Message):
+    instruction = (
+        '👩‍💼 <b>Как пользоваться ботом</b>\n\n'
+
+        '<b>1. Подключение рабочей группы</b>\n'
+        '• Добавьте бота в Telegram-группу с включёнными темами.\n'
+        '• Сделайте бота администратором и разрешите ему управлять темами.\n'
+        '• В этой группе отправьте команду /bind.\n'
+        '• После успешной привязки заявки и вопросы клиентов будут приходить туда.\n\n'
+
+        '<b>2. Работа с клиентами</b>\n'
+        '• Каждый клиент после /start регистрируется в базе бота.\n'
+        '• Для каждого клиента бот создаёт отдельную тему в рабочей группе '
+        'и затем использует её повторно.\n'
+        '• Тексты заявок и вопросов сохраняются в базе данных.\n'
+        '• Чтобы ответить клиенту, откройте его тему и используйте '
+        '<b>«Ответить / Reply»</b> именно на сообщение бота с заявкой или вопросом.\n'
+        '• Обычное сообщение в теме клиенту автоматически не отправляется.\n\n'
+
+        '<b>3. Прайс и раздел «О нас»</b>\n'
+        '• Кнопка «Изменить прайс» меняет прайс, который видят пользователи.\n'
+        '• Кнопка «Изменить "О нас"» меняет описание сервиса.\n'
+        '• Эти настройки хранятся в базе данных и не удаляются при обычном '
+        'перезапуске самого бота.\n\n'
+
+        '<b>4. Рассылка</b>\n'
+        '• Нажмите «Сделать рассылку» и отправьте текст.\n'
+        '• Бот покажет предпросмотр. После этого рассылку можно подтвердить '
+        'или вернуться к изменению текста.\n'
+        '• Рассылка отправляется активным пользователям.\n'
+        '• Если пользователь заблокировал бота, он помечается неактивным.\n'
+        '• Если Telegram временно ограничит скорость отправки, бот подождёт '
+        'и повторит попытку автоматически.\n\n'
+
+        '<b>5. Важно про группу и темы</b>\n'
+        '⚠️ В текущей версии автоматическая смена привязанной группы не предусмотрена.\n'
+        'Удаление бота из группы <b>не удаляет</b> пользователей, обращения, '
+        'прайс и описание из базы, но привязка к старой группе остаётся сохранённой.\n\n'
+        'Если бота случайно удалили, лучше добавить его обратно <b>в ту же группу</b> '
+        'и снова выдать права администратора и право управления темами.\n\n'
+        '⚠️ <b>Не удаляйте темы клиентов вручную.</b> '
+        'Бот запоминает тему клиента и рассчитывает, что она продолжает существовать. '
+        'Если рабочую группу нужно полностью заменить или тема клиента была удалена, '
+        'потребуется техническая перенастройка.\n\n'
+
+        '<b>6. Какие данные сохраняются</b>\n'
+        'Бот хранит пользователей, их активность, ID клиентских тем, '
+        'тексты заявок и вопросов, текущий прайс, текст «О нас» '
+        'и ID рабочей группы.\n\n'
+
+        'Если бот перезапустится, данные из базы сохранятся. '
+        'Пользователь, который в этот момент находился посередине заполнения формы, '
+        'может потерять только текущий незавершённый шаг и начать заполнение заново.'
+    )
+
+    try:
+        await message.answer(
+            text=instruction,
+            reply_markup=get_admin_keyboard()
+        )
+    except TelegramForbiddenError:
+        pass
+
+
 @router.message(F.text == 'Меню', F.chat.type == 'private')
 async def menu(message: types.Message, state: FSMContext):
     await state.clear()
@@ -279,11 +364,16 @@ async def menu(message: types.Message, state: FSMContext):
         return
 
     if user.id != Config.ADMIN_ID:
+        price = await get_price()
+
+        if price is None:
+            price = 'Прайс уточняется у администратора.'
+
         try:
             await message.answer(text=(
-                "👋 <b>Добро пожаловать!</b>\n\n"
-                "💰 Наш текущий прайс: <b>100 рублей</b>\n\n"
-                "👇 <i>Выберите нужное действие в меню ниже:</i>"),
+                f"👋 <b>Добро пожаловать!</b>\n\n"
+                f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
+                f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
                 reply_markup=get_main_keyboard())
         except TelegramForbiddenError:
             pass
@@ -301,12 +391,19 @@ async def back(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
 
     if current_state is None:
-        await message.answer(text=(
-            "👋 <b>Добро пожаловать!</b>\n\n"
-            "💰 Наш текущий прайс: <b>100 рублей</b>\n\n"
-            "👇 <i>Выберите нужное действие в меню ниже:</i>"),
-            reply_markup=get_main_keyboard()
-        )
+        price = await get_price()
+
+        if price is None:
+            price = 'Прайс уточняется у администратора.'
+
+        try:
+            await message.answer(text=(
+                f"👋 <b>Добро пожаловать!</b>\n\n"
+                f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
+                f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
+                reply_markup=get_main_keyboard())
+        except TelegramForbiddenError:
+            pass
 
         return
 
@@ -679,7 +776,7 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
                 while True:
                     try:
                         await bot.send_message(chat_id=telegram_id,
-                                               text=html.escape(data['newsletter']))
+                                               text=html.escape(data['newsletter']), reply_markup=get_main_keyboard())
                         sent += 1
 
                         break
@@ -752,6 +849,40 @@ async def set_about_us(message: types.Message, state: FSMContext):
 
     try:
         await message.answer(text='Текст был успешно изменен!',
+                             reply_markup=get_admin_keyboard())
+    except TelegramForbiddenError:
+        pass
+
+
+@router.message(ChangePrice.price,
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def set_price_text(message: types.Message, state: FSMContext):
+    if message.text is None:
+        try:
+            await message.answer(text='⚠️ <i>Текст не распознан. Пожалуйста, напишите ваш прайс:</i>')
+        except TelegramForbiddenError:
+            pass
+
+        return
+
+    await state.update_data(price=message.text)
+    data = await state.get_data()
+
+    await state.clear()
+
+    status = await set_price(data['price'])
+
+    if not status:
+        try:
+            await message.answer(text='Прайс не был сохранен! Пожалуйста, попробуйте снова.')
+        except TelegramForbiddenError:
+            pass
+
+        return
+
+    try:
+        await message.answer(text='Прайс был успешно изменен!',
                              reply_markup=get_admin_keyboard())
     except TelegramForbiddenError:
         pass

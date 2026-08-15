@@ -5,25 +5,22 @@ from sqlalchemy import select
 
 
 async def add_user(user_id):
-    entry = Users(telegram_id=user_id, is_active=True)
     query = select(Users).where(Users.telegram_id == user_id)
 
     async with async_session_maker() as session:
-        try:
-            session.add(entry)
-            await session.commit()
+        result = await session.execute(query)
+        telegram_user = result.scalar_one_or_none()
 
-        except IntegrityError:
-            await session.rollback()
-
-            result = await session.execute(query)
-
-            telegram_user = result.scalar_one_or_none()
+        if telegram_user is None:
+            telegram_user = Users(
+                telegram_id=user_id,
+                is_active=True
+            )
+            session.add(telegram_user)
+        else:
             telegram_user.is_active = True
 
-            await session.commit()
-
-
+        await session.commit()
 
 
 async def save_user_appeal(user_id, message, appeal_type):
@@ -174,6 +171,20 @@ async def get_about_us():
         return setting.about_us_text
 
 
+async def get_price():
+    query = select(Settings).where(Settings.id == 1)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        setting = result.scalar_one_or_none()
+
+        if setting is None or setting.price_text is None:
+            return None
+
+        return setting.price_text
+
+
 async def get_users():
     query = select(Users.telegram_id, Users.is_active)
 
@@ -241,6 +252,28 @@ async def set_about_us_text(about_us_text):
             return True
 
         setting.about_us_text = about_us_text
+        await session.commit()
+
+        return True
+
+
+async def set_price(price):
+    query = select(Settings).where(Settings.id == 1)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        setting = result.scalar_one_or_none()
+
+        if setting is None:
+            entry = Settings(id=1, group_id=None, price_text=price)
+
+            session.add(entry)
+            await session.commit()
+
+            return True
+
+        setting.price_text = price
         await session.commit()
 
         return True

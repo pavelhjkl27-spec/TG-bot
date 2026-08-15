@@ -18,3 +18,8 @@ class Newsletter(StatesGroup):
 
 class ChangeAboutUs(StatesGroup):
     about_us_text = State()
+
+
+class ChangePrice(StatesGroup):
+    price = State()
+

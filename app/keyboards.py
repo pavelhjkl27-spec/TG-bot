@@ -10,7 +10,7 @@ def get_main_keyboard():
         [
             types.KeyboardButton(text='О нас')
         ]
-    ], resize_keyboard=True, one_time_keyboard=True)
+    ], resize_keyboard=True)
 
     return keyboard
 
@@ -49,7 +49,7 @@ def get_admin_keyboard():
                 types.KeyboardButton(text='Изменить "О нас"'),
                 types.KeyboardButton(text='Изменить прайс')
             ],
-        ], resize_keyboard=True, one_time_keyboard=True
+        ], resize_keyboard=True
     )
 
     return keyboard
