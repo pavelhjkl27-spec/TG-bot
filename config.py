@@ -8,6 +8,6 @@ class Config:
     SECRET_KEY = os.getenv('SECRET_KEY')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     BOT_TOKEN = os.getenv('BOT_TOKEN')
-    ADMIN_ID = int(os.getenv('ADMIN_ID', default='0'))
+    ADMIN_ID = int(os.environ['ADMIN_ID'])
 
 

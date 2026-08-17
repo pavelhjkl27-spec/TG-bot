@@ -1,6 +1,5 @@
-import re
+from datetime import datetime
 import html
-import asyncio
 
 from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
@@ -186,7 +185,7 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
 
 @router.my_chat_member(ChatMemberUpdatedFilter(IS_MEMBER >> IS_NOT_MEMBER),
                     F.chat.type == 'private')
-async def bot_removed_from_chat(event: types.ChatMemberUpdated, bot: Bot):
+async def bot_removed_from_chat(event: types.ChatMemberUpdated):
     await deactivated_user(event.from_user.id)
 
 
@@ -446,7 +445,13 @@ async def reply_to_message(message: types.Message, bot: Bot):
 
     original_message = message.reply_to_message
 
-    if not original_message or not original_message.text or not message.text:
+    if not original_message or not original_message.text:
+        return
+
+    if original_message.from_user is None or original_message.from_user.id != bot.id:
+        await message.answer(
+            text='Чтобы ответ дошёл клиенту, используйте Reply именно на сообщение бота с заявкой или вопросом.'
+        )
         return
 
     user_id = await get_user_id(message.message_thread_id)
@@ -459,17 +464,28 @@ async def reply_to_message(message: types.Message, bot: Bot):
 
         return
 
-    reply_text = (
-        f"📩 <b>Ответ на вашу заявку:</b>\n"
-        f"<i>{html.escape(original_message.text)}</i>\n\n"
-        f"💬 <b>Сообщение от администратора:</b>\n"
-        f"{html.escape(message.text)}"
+    original_text = original_message.text
+
+    if len(original_text) > 2500:
+        original_text = original_text[:2500] + '…'
+
+    context_text = (
+        f"📩 <b>Ответ администратора на ваше обращение:</b>\n"
+        f"<i>{html.escape(original_text)}</i>\n\n"
+        f"💬 <b>Сообщение администратора:</b>"
     )
 
     try:
-        await bot.send_message(chat_id=user_id, text=reply_text)
+        await bot.send_message(chat_id=user_id, text=context_text)
+        await message.copy_to(chat_id=user_id)
     except TelegramForbiddenError:
-        await message.answer(text='Пользователь только что заблокировал бота, поэтому ваше сообщение не доставлено.')
+        await message.answer(
+            text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.'
+        )
+    except (TelegramBadRequest, TelegramRetryAfter):
+        await message.answer(
+            text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.'
+        )
 
 
 @router.message(Form.name,
@@ -496,14 +512,22 @@ async def set_birthday(message: types.Message, state: FSMContext):
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID)
 async def set_text(message: types.Message, state: FSMContext):
-    if not message or not message.text or not re.fullmatch(
-            r'^(0?[1-9]|[12][0-9]|3[01])/(0?[1-9]|1[0-2])/\d{4}$', message.text):
+    if not message or not message.text:
         await message.answer(text=(
             "⚠️ <b>Ошибка формата</b>\n\n"
             "Пожалуйста, введите дату строго в формате <code>ДД/ММ/ГГГГ</code>\n"
             "<i>Пример: 05/12/1984</i>")
         )
+        return
 
+    try:
+        datetime.strptime(message.text, '%d/%m/%Y')
+    except ValueError:
+        await message.answer(text=(
+            "⚠️ <b>Некорректная дата</b>\n\n"
+            "Пожалуйста, введите существующую дату в формате <code>ДД/ММ/ГГГГ</code>\n"
+            "<i>Пример: 05/12/1984</i>")
+        )
         return
 
     await state.update_data(birthday=message.text)
@@ -523,13 +547,10 @@ async def set_text(message: types.Message, state: FSMContext):
 async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     if not message or not message.text:
         await message.answer(text="⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше обращение:</i>")
-
         return
 
     await state.update_data(text=message.text)
     data = await state.get_data()
-
-    await state.clear()
 
     user = message.from_user
 
@@ -540,7 +561,6 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
 
     if group_id is None:
         await message.answer(text='Бот временно не работает, попробуйте позже.')
-
         return
 
     topic_id = await get_user_thread_id(user.id)
@@ -553,14 +573,12 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
                 await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
             except TelegramForbiddenError:
                 pass
-
             return
 
         try:
             topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramRetryAfter):
             await message.answer(text='Ошибка на стороне сервера. Попробуйте создать заявку позже.')
-
             return
 
         topic_id = topic.message_thread_id
@@ -569,22 +587,22 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
 
         if not status:
             await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
-
             return
 
     try:
-        await bot.send_message(chat_id=group_id,
-                                text=(
-                                    f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
-                                    f"👤 <b>Имя:</b> {html.escape(data['name'])}\n"
-                                    f"📅 <b>Дата рождения:</b> {html.escape(data['birthday'])}\n\n"
-                                    f"💬 <b>Обращение:</b>\n"
-                                    f"<i>{html.escape(data['text'])}</i>"),
-                                message_thread_id=topic_id
-                                )
-    except TelegramBadRequest:
-        await message.answer(text='Ваша заявка не была доставлена. Ошибка на сервере.')
-
+        await bot.send_message(
+                chat_id=group_id,
+                text=(
+                    f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+                    f"👤 <b>Имя:</b> {html.escape(data['name'])}\n"
+                    f"📅 <b>Дата рождения:</b> {html.escape(data['birthday'])}\n\n"
+                    f"💬 <b>Обращение:</b>\n"
+                    f"<i>{html.escape(data['text'])}</i>"
+                ),
+                message_thread_id=topic_id
+            )
+    except (TelegramBadRequest, TelegramRetryAfter):
+        await message.answer(text='Ваша заявка не была доставлена. Попробуйте отправить её ещё раз чуть позже.')
         return
 
     result = await save_user_appeal(user.id, message.text, 'Bid')
@@ -592,12 +610,13 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     if not result:
         try:
             await message.answer(
-                text='Произошла ошибка на стороне сервер. Пожалуйста, напишите \\start'
+                text='Произошла ошибка на стороне сервера. Пожалуйста, напишите /start'
             )
         except TelegramForbiddenError:
             pass
-
         return
+
+    await state.clear()
 
     try:
         await message.answer(
@@ -620,13 +639,10 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             await message.answer(text='Текст не распознан. Пожалуйста, напишите вопрос текстом!')
         except TelegramForbiddenError:
             pass
-
         return
 
     await state.update_data(question=message.text)
     data = await state.get_data()
-
-    await state.clear()
 
     user = message.from_user
 
@@ -640,7 +656,6 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             await message.answer(text='Ошибка на сервере. Попробуйте позже.')
         except TelegramForbiddenError:
             pass
-
         return
 
     topic_id = await get_user_thread_id(user.id)
@@ -653,14 +668,12 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
                 await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
             except TelegramForbiddenError:
                 pass
-
             return
 
         try:
             topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramRetryAfter):
             await message.answer(text='Ошибка на стороне сервера. Попробуйте задать вопрос позже.')
-
             return
 
         topic_id = topic.message_thread_id
@@ -672,17 +685,16 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
                 await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
             except TelegramForbiddenError:
                 pass
-
             return
 
     try:
-        await bot.send_message(chat_id=group_id,
-                                text=f'Новый вопрос!\n\n'
-                                    f'{html.escape(data["question"])}',
-                                message_thread_id=topic_id)
-    except TelegramBadRequest:
-        await message.answer(text='Ваш вопрос не был доставлен. Ошибка на сервере.')
-
+        await bot.send_message(
+                chat_id=group_id,
+                text=f'Новый вопрос!\n\n{html.escape(data["question"])}',
+                message_thread_id=topic_id
+            )
+    except (TelegramBadRequest, TelegramRetryAfter):
+        await message.answer(text='Ваш вопрос не был доставлен. Попробуйте отправить его ещё раз чуть позже.')
         return
 
     result = await save_user_appeal(user.id, message.text, 'Question')
@@ -690,12 +702,13 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
     if not result:
         try:
             await message.answer(
-                text='Произошла ошибка на стороне сервер. Пожалуйста, напишите /start'
+                text='Произошла ошибка на стороне сервера. Пожалуйста, напишите /start'
             )
         except TelegramForbiddenError:
             pass
-
         return
+
+    await state.clear()
 
     try:
         await message.answer(
@@ -773,24 +786,15 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
 
         for telegram_id, is_active in users:
             if is_active:
-                while True:
-                    try:
-                        await bot.send_message(chat_id=telegram_id,
-                                               text=html.escape(data['newsletter']), reply_markup=get_main_keyboard())
-                        sent += 1
-
-                        break
-                    except TelegramForbiddenError:
-                        not_sent += 1
-                        await deactivated_user(telegram_id)
-
-                        break
-                    except TelegramBadRequest:
-                        not_sent += 1
-
-                        break
-                    except TelegramRetryAfter as error:
-                        await asyncio.sleep(error.retry_after)
+                try:
+                    await bot.send_message(chat_id=telegram_id,
+                                           text=html.escape(data['newsletter']), reply_markup=get_main_keyboard())
+                    sent += 1
+                except TelegramForbiddenError:
+                    not_sent += 1
+                    await deactivated_user(telegram_id)
+                except (TelegramBadRequest, TelegramRetryAfter):
+                    not_sent += 1
 
         try:
             await message.answer(
