@@ -136,11 +136,20 @@ async def save_group_id(group_id):
 
         if setting is None:
             entry = Settings(id=1, group_id=group_id)
-
             session.add(entry)
-            await session.commit()
 
-            return True
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+
+                result = await session.execute(query)
+                setting = result.scalar_one_or_none()
+
+                if setting is None:
+                    return False
+            else:
+                return True
 
         if setting.group_id is not None:
             if setting.group_id != group_id:
@@ -245,11 +254,20 @@ async def set_about_us_text(about_us_text):
 
         if setting is None:
             entry = Settings(id=1, group_id=None, about_us_text=about_us_text)
-
             session.add(entry)
-            await session.commit()
 
-            return True
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+
+                result = await session.execute(query)
+                setting = result.scalar_one_or_none()
+
+                if setting is None:
+                    return False
+            else:
+                return True
 
         setting.about_us_text = about_us_text
         await session.commit()
@@ -267,11 +285,20 @@ async def set_price(price):
 
         if setting is None:
             entry = Settings(id=1, group_id=None, price_text=price)
-
             session.add(entry)
-            await session.commit()
 
-            return True
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+
+                result = await session.execute(query)
+                setting = result.scalar_one_or_none()
+
+                if setting is None:
+                    return False
+            else:
+                return True
 
         setting.price_text = price
         await session.commit()

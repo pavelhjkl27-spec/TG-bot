@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 import html
 import logging
@@ -92,7 +93,17 @@ async def cmd_bind(message: types.Message, bot: Bot):
 
         return
 
-    bot_member = await bot.get_chat_member(chat_id=message.chat.id, user_id=bot.id)
+    try:
+        bot_member = await bot.get_chat_member(chat_id=message.chat.id, user_id=bot.id)
+    except TelegramBadRequest as error:
+        logger.warning("Не удалось проверить статус бота в чате chat_id=%s: %s", message.chat.id, error)
+
+        try:
+            await message.answer(text='Не удалось проверить бота в этом чате. Убедитесь, что бот добавлен в группу, и повторите /bind.')
+        except TelegramBadRequest:
+            pass
+
+        return
 
     if not isinstance(bot_member, types.ChatMemberAdministrator):
         try:
@@ -150,6 +161,9 @@ async def cmd_bind(message: types.Message, bot: Bot):
 @router.my_chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
 async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
     user = event.from_user
+
+    if user is None:
+        return
 
     if event.chat.type == 'private':
         status = await activated_user(user.id)
@@ -578,6 +592,10 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         await message.answer(text="⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше обращение:</i>")
         return
 
+    if len(message.text) > 4096:
+        await message.answer(text='Текст обращения слишком длинный. Пожалуйста, сократите его до 4096 символов.')
+        return
+
     await state.update_data(text=message.text)
     data = await state.get_data()
 
@@ -616,6 +634,10 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         status = await set_user_thread_id(user.id, topic_id)
 
         if not status:
+            logger.error(
+                "Тема topic_id=%s создана в Telegram, но не привязана к user_id=%s (пользователь не найден) — тема осиротела",
+                topic_id, user.id
+            )
             await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
             return
 
@@ -674,6 +696,10 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             pass
         return
 
+    if len(message.text) > 4096:
+        await message.answer(text='Текст вопроса слишком длинный. Пожалуйста, сократите его до 4096 символов.')
+        return
+
     await state.update_data(question=message.text)
     data = await state.get_data()
 
@@ -716,6 +742,10 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         status = await set_user_thread_id(user.id, topic_id)
 
         if not status:
+            logger.error(
+                "Тема topic_id=%s создана в Telegram, но не привязана к user_id=%s (пользователь не найден) — тема осиротела",
+                topic_id, user.id
+            )
             try:
                 await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
             except TelegramForbiddenError as error:
@@ -839,6 +869,8 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
                     await deactivated_user(telegram_id)
                 except (TelegramBadRequest, TelegramRetryAfter):
                     not_sent += 1
+
+                await asyncio.sleep(0.05)
 
         try:
             await message.answer(

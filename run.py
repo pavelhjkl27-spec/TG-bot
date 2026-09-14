@@ -34,16 +34,23 @@ async def retry_after_middleware(make_request, bot, method):
             return await make_request(bot, method)
 
         except TelegramRetryAfter as error:
+            method_name = method.__class__.__name__
+            chat_id = getattr(method, 'chat_id', None)
+
             if attempt == attempts - 1:
                 logger.warning(
-                    'Telegram rate limit after %s attempts: %s',
+                    'Telegram rate limit after %s attempts for %s (chat_id=%s): %s',
                     attempts,
+                    method_name,
+                    chat_id,
                     error
                 )
                 raise
 
             logger.warning(
-                'Telegram rate limit. Retry after %s seconds.',
+                'Telegram rate limit for %s (chat_id=%s). Retry after %s seconds.',
+                method_name,
+                chat_id,
                 error.retry_after
             )
 
@@ -58,10 +65,34 @@ dp = Dispatcher(
 dp.include_router(router)
 
 
+@dp.errors()
+async def on_error(event):
+    logger.exception(
+        'Необработанное исключение при обработке апдейта %s: %s',
+        event.update.update_id,
+        event.exception
+    )
+    return True
+
+
 async def main():
     logger.info('Bot is starting...')
 
-    await init_db()
+    db_init_attempts = 5
+
+    for attempt in range(db_init_attempts):
+        try:
+            await init_db()
+            break
+        except Exception as error:
+            if attempt == db_init_attempts - 1:
+                raise
+
+            logger.warning(
+                'Database not ready (attempt %s/%s): %s',
+                attempt + 1, db_init_attempts, error
+            )
+            await asyncio.sleep(2)
 
     logger.info('Database initialized')
 
