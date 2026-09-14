@@ -4,7 +4,7 @@ import html
 import logging
 
 from aiogram import Router, types, F, Bot
-from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
+from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
@@ -24,10 +24,13 @@ from app.db_requests import (add_user,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
                              set_price)
+from app.utils import exceeds_telegram_limit
 
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+NAME_MAX_LENGTH = 200
 
 
 @router.message(CommandStart(), F.chat.type == 'private')
@@ -218,7 +221,8 @@ async def bot_removed_from_chat(event: types.ChatMemberUpdated):
 
 @router.message(F.text == 'Оставить заявку',
                 F.chat.type == 'private',
-                F.from_user.id != Config.ADMIN_ID)
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(None))
 async def set_name(message: types.Message, state: FSMContext):
     await state.set_state(Form.name)
 
@@ -235,7 +239,8 @@ async def set_name(message: types.Message, state: FSMContext):
 
 @router.message(F.text == 'О нас',
                 F.chat.type == 'private',
-                F.from_user.id != Config.ADMIN_ID)
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(None))
 async def about_us(message: types.Message):
     user = message.from_user
 
@@ -264,7 +269,8 @@ async def about_us(message: types.Message):
 
 @router.message(F.text == 'Задать вопрос',
                 F.chat.type == 'private',
-                F.from_user.id != Config.ADMIN_ID)
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(None))
 async def question_text(message: types.Message, state: FSMContext):
     await state.set_state(Question.question)
 
@@ -280,7 +286,8 @@ async def question_text(message: types.Message, state: FSMContext):
 
 @router.message(F.text == 'Сделать рассылку',
                 F.chat.type == 'private',
-                F.from_user.id == Config.ADMIN_ID)
+                F.from_user.id == Config.ADMIN_ID,
+                StateFilter(None))
 async def newsletter(message: types.Message, state: FSMContext):
     await state.set_state(Newsletter.text)
 
@@ -296,7 +303,8 @@ async def newsletter(message: types.Message, state: FSMContext):
 
 @router.message(F.text == 'Изменить "О нас"',
                 F.chat.type == 'private',
-                F.from_user.id == Config.ADMIN_ID)
+                F.from_user.id == Config.ADMIN_ID,
+                StateFilter(None))
 async def change_about_us(message: types.Message, state: FSMContext):
     await state.set_state(ChangeAboutUs.about_us_text)
 
@@ -309,7 +317,8 @@ async def change_about_us(message: types.Message, state: FSMContext):
 
 @router.message(F.text == 'Изменить прайс',
                 F.chat.type == 'private',
-                F.from_user.id == Config.ADMIN_ID)
+                F.from_user.id == Config.ADMIN_ID,
+                StateFilter(None))
 async def change_price(message: types.Message, state: FSMContext):
     await state.set_state(ChangePrice.price)
 
@@ -322,7 +331,8 @@ async def change_price(message: types.Message, state: FSMContext):
 
 @router.message(F.text == 'Как пользоваться ботом?',
                 F.chat.type == 'private',
-                F.from_user.id == Config.ADMIN_ID)
+                F.from_user.id == Config.ADMIN_ID,
+                StateFilter(None))
 async def admin_instruction(message: types.Message):
     instruction = (
         '👩‍💼 <b>Как пользоваться ботом</b>\n\n'
@@ -540,6 +550,14 @@ async def set_birthday(message: types.Message, state: FSMContext):
 
         return
 
+    if len(message.text) > NAME_MAX_LENGTH:
+        await message.answer(text=(
+            f"⚠️ <i>Введённое имя слишком длинное (максимум {NAME_MAX_LENGTH} "
+            f"символов). Пожалуйста, введите имя короче:</i>")
+        )
+
+        return
+
     await state.update_data(name=message.text)
     await state.set_state(Form.birthday)
 
@@ -592,12 +610,26 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         await message.answer(text="⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше обращение:</i>")
         return
 
-    if len(message.text) > 4096:
-        await message.answer(text='Текст обращения слишком длинный. Пожалуйста, сократите его до 4096 символов.')
-        return
-
     await state.update_data(text=message.text)
     data = await state.get_data()
+
+    final_text = (
+        f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+        f"👤 <b>Имя:</b> {html.escape(data['name'])}\n"
+        f"📅 <b>Дата рождения:</b> {html.escape(data['birthday'])}\n\n"
+        f"💬 <b>Обращение:</b>\n"
+        f"<i>{html.escape(data['text'])}</i>"
+    )
+
+    overflow = exceeds_telegram_limit(final_text)
+
+    if overflow:
+        await message.answer(text=(
+            f"⚠️ Текст обращения слишком длинный — сообщение получится на "
+            f"{overflow} символ(ов) больше допустимого лимита Telegram. "
+            f"Пожалуйста, сократите текст обращения и отправьте его заново."
+        ))
+        return
 
     user = message.from_user
 
@@ -644,13 +676,7 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     try:
         await bot.send_message(
                 chat_id=group_id,
-                text=(
-                    f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
-                    f"👤 <b>Имя:</b> {html.escape(data['name'])}\n"
-                    f"📅 <b>Дата рождения:</b> {html.escape(data['birthday'])}\n\n"
-                    f"💬 <b>Обращение:</b>\n"
-                    f"<i>{html.escape(data['text'])}</i>"
-                ),
+                text=final_text,
                 message_thread_id=topic_id
             )
     except (TelegramBadRequest, TelegramRetryAfter):
@@ -696,12 +722,20 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             pass
         return
 
-    if len(message.text) > 4096:
-        await message.answer(text='Текст вопроса слишком длинный. Пожалуйста, сократите его до 4096 символов.')
-        return
-
     await state.update_data(question=message.text)
     data = await state.get_data()
+
+    final_text = f'Новый вопрос!\n\n{html.escape(data["question"])}'
+
+    overflow = exceeds_telegram_limit(final_text)
+
+    if overflow:
+        await message.answer(text=(
+            f"⚠️ Текст вопроса слишком длинный — сообщение получится на "
+            f"{overflow} символ(ов) больше допустимого лимита Telegram. "
+            f"Пожалуйста, сократите вопрос и отправьте его заново."
+        ))
+        return
 
     user = message.from_user
 
@@ -756,7 +790,7 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
     try:
         await bot.send_message(
                 chat_id=group_id,
-                text=f'Новый вопрос!\n\n{html.escape(data["question"])}',
+                text=final_text,
                 message_thread_id=topic_id
             )
     except (TelegramBadRequest, TelegramRetryAfter):
@@ -803,9 +837,15 @@ async def send_newsletter(message: types.Message, state: FSMContext):
 
         return
 
-    if len(message.text) > 4096:
+    overflow = exceeds_telegram_limit(html.escape(message.text))
+
+    if overflow:
         try:
-            await message.answer(text='Ваше сообщение слишком длинное! Пожалуйста, учтите ограничение в 4096 символов.')
+            await message.answer(text=(
+                f"⚠️ Текст рассылки слишком длинный — сообщение получится на "
+                f"{overflow} символ(ов) больше допустимого лимита Telegram. "
+                f"Пожалуйста, сократите текст."
+            ))
         except TelegramForbiddenError as error:
             logger.warning("Не удалось уведомить админа о превышении длины рассылки admin_id=%s: %s", message.from_user.id, error)
             pass
