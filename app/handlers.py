@@ -7,6 +7,7 @@ from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
@@ -31,6 +32,58 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 NAME_MAX_LENGTH = 200
+
+
+class TopicResolutionError(Exception):
+    """
+    Поднимается, если тему клиента в рабочей группе не удалось получить или
+    создать. reason — machine-readable причина ('not_registered',
+    'telegram_error', 'db_error'), по которой вызывающий код сам выбирает
+    подходящий пользователю текст (тексты для заявки и вопроса исторически
+    отличаются, поэтому текст не зашит внутрь исключения).
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def resolve_client_topic(bot: Bot, user: types.User, group_id: int) -> int:
+    topic_id = await get_user_thread_id(user.id)
+
+    if topic_id is not None:
+        return topic_id
+
+    topic_name = await get_topic_name(user.id)
+
+    if topic_name is None:
+        raise TopicResolutionError('not_registered')
+
+    try:
+        topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
+    except (TelegramBadRequest, TelegramRetryAfter):
+        raise TopicResolutionError('telegram_error')
+
+    topic_id = topic.message_thread_id
+
+    try:
+        status = await set_user_thread_id(user.id, topic_id)
+    except SQLAlchemyError as error:
+        logger.error(
+            "Тема topic_id=%s создана в Telegram для user_id=%s, но привязать её в БД не удалось "
+            "(ошибка БД) — тема осиротела: %s",
+            topic_id, user.id, error
+        )
+        raise TopicResolutionError('db_error')
+
+    if not status:
+        logger.error(
+            "Тема topic_id=%s создана в Telegram, но не привязана к user_id=%s (пользователь не найден) — тема осиротела",
+            topic_id, user.id
+        )
+        raise TopicResolutionError('not_registered')
+
+    return topic_id
 
 
 @router.message(CommandStart(), F.chat.type == 'private')
@@ -495,12 +548,19 @@ async def reply_to_message(message: types.Message, bot: Bot):
 
     original_message = message.reply_to_message
 
-    if not original_message or not original_message.text:
+    if original_message is None:
         return
 
     if original_message.from_user is None or original_message.from_user.id != bot.id:
         await message.answer(
             text='Чтобы ответ дошёл клиенту, используйте Reply именно на сообщение бота с заявкой или вопросом.'
+        )
+        return
+
+    if not original_message.text:
+        await message.answer(
+            text='Сообщение, на которое вы ответили, не содержит текста. Чтобы ответ дошёл клиенту, '
+                 'используйте Reply на текстовое сообщение бота с заявкой или вопросом клиента.'
         )
         return
 
@@ -528,6 +588,20 @@ async def reply_to_message(message: types.Message, bot: Bot):
 
     try:
         await bot.send_message(chat_id=user_id, text=context_text)
+    except TelegramForbiddenError as error:
+        logger.error("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
+        await message.answer(
+            text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.'
+        )
+        return
+    except (TelegramBadRequest, TelegramRetryAfter) as error:
+        logger.error("Доставка ответа админа пользователю user_id=%s не удалась: %s", user_id, error)
+        await message.answer(
+            text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.'
+        )
+        return
+
+    try:
         await message.copy_to(chat_id=user_id)
     except TelegramForbiddenError as error:
         logger.error("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
@@ -535,10 +609,26 @@ async def reply_to_message(message: types.Message, bot: Bot):
             text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.'
         )
     except (TelegramBadRequest, TelegramRetryAfter) as error:
-        logger.error("Доставка ответа админа пользователю user_id=%s не удалась: %s", user_id, error)
+        logger.error(
+            "Доставка содержимого ответа админа пользователю user_id=%s не удалась после отправки заголовка: %s",
+            user_id, error
+        )
         await message.answer(
             text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.'
         )
+
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text='⚠️ К сожалению, часть ответа администратора не удалось доставить. '
+                     'Пожалуйста, обратитесь ещё раз, если вопрос остался открытым.'
+            )
+        except (TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter) as fallback_error:
+            logger.warning(
+                "Не удалось уведомить клиента user_id=%s о частично не доставленном ответе админа: %s",
+                user_id, fallback_error
+            )
+            pass
 
 
 @router.message(Form.name,
@@ -642,36 +732,23 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         await message.answer(text='Бот временно не работает, попробуйте позже.')
         return
 
-    topic_id = await get_user_thread_id(user.id)
-
-    if topic_id is None:
-        topic_name = await get_topic_name(user.id)
-
-        if topic_name is None:
-            try:
-                await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
-            except TelegramForbiddenError as error:
-                logger.warning("Не удалось уведомить о необходимости /start (заявка) user_id=%s: %s", user.id, error)
-                pass
-            return
+    try:
+        topic_id = await resolve_client_topic(bot, user, group_id)
+    except TopicResolutionError as error:
+        if error.reason == 'telegram_error':
+            text = 'Ошибка на стороне сервера. Попробуйте создать заявку позже.'
+        elif error.reason == 'db_error':
+            text = 'Временная ошибка на сервере. Попробуйте отправить заявку ещё раз через некоторое время.'
+        else:
+            text = 'Вы не зарегистрированы в боте. Напишите /start'
 
         try:
-            topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
-        except (TelegramBadRequest, TelegramRetryAfter):
-            await message.answer(text='Ошибка на стороне сервера. Попробуйте создать заявку позже.')
-            return
+            await message.answer(text=text)
+        except TelegramForbiddenError as tg_error:
+            logger.warning("Не удалось уведомить о невозможности создать тему (заявка) user_id=%s: %s", user.id, tg_error)
+            pass
 
-        topic_id = topic.message_thread_id
-
-        status = await set_user_thread_id(user.id, topic_id)
-
-        if not status:
-            logger.error(
-                "Тема topic_id=%s создана в Telegram, но не привязана к user_id=%s (пользователь не найден) — тема осиротела",
-                topic_id, user.id
-            )
-            await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
-            return
+        return
 
     try:
         await bot.send_message(
@@ -683,7 +760,7 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         await message.answer(text='Ваша заявка не была доставлена. Попробуйте отправить её ещё раз чуть позже.')
         return
 
-    result = await save_user_appeal(user.id, message.text, 'Bid')
+    result = await save_user_appeal(user.id, message.text, 'Bid', name=data['name'], birthday=data['birthday'])
 
     if not result:
         try:
@@ -752,40 +829,23 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             pass
         return
 
-    topic_id = await get_user_thread_id(user.id)
-
-    if topic_id is None:
-        topic_name = await get_topic_name(user.id)
-
-        if topic_name is None:
-            try:
-                await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
-            except TelegramForbiddenError as error:
-                logger.warning("Не удалось уведомить о необходимости /start (вопрос) user_id=%s: %s", user.id, error)
-                pass
-            return
+    try:
+        topic_id = await resolve_client_topic(bot, user, group_id)
+    except TopicResolutionError as error:
+        if error.reason == 'telegram_error':
+            text = 'Ошибка на стороне сервера. Попробуйте задать вопрос позже.'
+        elif error.reason == 'db_error':
+            text = 'Временная ошибка на сервере. Попробуйте задать вопрос ещё раз через некоторое время.'
+        else:
+            text = 'Вы не зарегистрированы в боте. Пожалуйста, напишите /start'
 
         try:
-            topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
-        except (TelegramBadRequest, TelegramRetryAfter):
-            await message.answer(text='Ошибка на стороне сервера. Попробуйте задать вопрос позже.')
-            return
+            await message.answer(text=text)
+        except TelegramForbiddenError as tg_error:
+            logger.warning("Не удалось уведомить о невозможности создать тему (вопрос) user_id=%s: %s", user.id, tg_error)
+            pass
 
-        topic_id = topic.message_thread_id
-
-        status = await set_user_thread_id(user.id, topic_id)
-
-        if not status:
-            logger.error(
-                "Тема topic_id=%s создана в Telegram, но не привязана к user_id=%s (пользователь не найден) — тема осиротела",
-                topic_id, user.id
-            )
-            try:
-                await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
-            except TelegramForbiddenError as error:
-                logger.warning("Не удалось уведомить о необходимости /start после ошибки создания темы user_id=%s: %s", user.id, error)
-                pass
-            return
+        return
 
     try:
         await bot.send_message(

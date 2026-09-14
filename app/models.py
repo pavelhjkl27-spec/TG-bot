@@ -23,6 +23,8 @@ class Requests(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     type = Column(String(20), nullable=False)
+    name = Column(Text, nullable=True)
+    birthday = Column(String(10), nullable=True)
     text = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda _: datetime.now(timezone.utc))
 

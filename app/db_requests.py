@@ -23,7 +23,7 @@ async def add_user(user_id):
         await session.commit()
 
 
-async def save_user_appeal(user_id, message, appeal_type):
+async def save_user_appeal(user_id, message, appeal_type, name=None, birthday=None):
     query = select(Users).where(
         Users.telegram_id == user_id
     )
@@ -39,7 +39,9 @@ async def save_user_appeal(user_id, message, appeal_type):
         entry = Requests(
             user_id=telegram_user.id,
             type=appeal_type,
-            text=message
+            text=message,
+            name=name,
+            birthday=birthday
         )
 
         session.add(entry)
