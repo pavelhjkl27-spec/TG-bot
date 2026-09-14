@@ -1,5 +1,6 @@
 from datetime import datetime
 import html
+import logging
 
 from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
@@ -22,6 +23,8 @@ from app.db_requests import (add_user,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
                              set_price)
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -52,7 +55,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
                 f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
                 reply_markup=keyboard)
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось отправить приветствие user_id=%s: %s", user.id, error)
             pass
 
         return
@@ -63,7 +67,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer(text='Здравствуйте, Екатерина!.\n\n'
                                   'Вам доступен уникальный функционал ниже:',
                              reply_markup=admin_keyboard)
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить приветствие администратору user_id=%s: %s", user.id, error)
         pass
 
 
@@ -92,7 +97,8 @@ async def cmd_bind(message: types.Message, bot: Bot):
     if not isinstance(bot_member, types.ChatMemberAdministrator):
         try:
             await message.answer(text='Сделайте бота администратором!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось отправить запрос прав администратора chat_id=%s: %s", message.chat.id, error)
             pass
 
         return
@@ -100,7 +106,8 @@ async def cmd_bind(message: types.Message, bot: Bot):
     if not bot_member.can_manage_topics:
         try:
             await message.answer(text='Разрешите боту управлять темами!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось отправить запрос прав на управление темами chat_id=%s: %s", message.chat.id, error)
             pass
 
         return
@@ -109,7 +116,8 @@ async def cmd_bind(message: types.Message, bot: Bot):
         try:
             await message.answer(text='Вы не являетесь админом этого бота, '
                                     'поэтому его функционал вам не доступен!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось уведомить пользователя user_id=%s о запрете /bind: %s", user.id, error)
             pass
 
         return
@@ -117,7 +125,8 @@ async def cmd_bind(message: types.Message, bot: Bot):
     if not message.chat.is_forum:
         try:
             await message.answer(text='Добавьте бота в форум/супергруппу!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось отправить запрос на форум/супергруппу chat_id=%s: %s", message.chat.id, error)
             pass
 
         return
@@ -129,7 +138,8 @@ async def cmd_bind(message: types.Message, bot: Bot):
             await message.answer(
                 text='Бот уже привязан к другой группе!'
             )
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось уведомить о конфликте привязки группы chat_id=%s: %s", message.chat.id, error)
             pass
 
         return
@@ -147,7 +157,8 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
         if not status:
             try:
                 await bot.send_message(chat_id=user.id, text='Чтобы начать пользоваться ботом, напишите /start')
-            except TelegramForbiddenError:
+            except TelegramForbiddenError as error:
+                logger.warning("Не удалось отправить приветствие после добавления в чат user_id=%s: %s", user.id, error)
                 pass
 
         return
@@ -160,7 +171,8 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
     if not event.chat.is_forum:
         try:
             await bot.send_message(chat_id=event.chat.id, text='Включите темы в группе!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось отправить запрос на включение тем chat_id=%s: %s", event.chat.id, error)
             pass
         finally:
             await bot.leave_chat(chat_id=event.chat.id)
@@ -172,7 +184,8 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
     if group_id is not None and group_id != event.chat.id:
         try:
             await bot.send_message(chat_id=event.chat.id, text='Бот уже привязан к другой группе!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось уведомить группу о конфликте привязки chat_id=%s: %s", event.chat.id, error)
             pass
         finally:
             await bot.leave_chat(chat_id=event.chat.id)
@@ -201,7 +214,8 @@ async def set_name(message: types.Message, state: FSMContext):
             "Пожалуйста, введите ваше <b>имя</b>:"),
             reply_markup=get_cancel_keyboard()
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить запрос имени user_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -219,7 +233,8 @@ async def about_us(message: types.Message):
     if about_us_text is None:
         try:
             await message.answer(text='Описание уточняется у администратора или ошибка на сервере.')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось отправить сообщение об отсутствии описания user_id=%s: %s", user.id, error)
             pass
 
         return
@@ -228,7 +243,8 @@ async def about_us(message: types.Message):
         await message.answer(
             text=html.escape(about_us_text)
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить текст 'О нас' user_id=%s: %s", user.id, error)
         pass
 
 
@@ -243,7 +259,8 @@ async def question_text(message: types.Message, state: FSMContext):
             text='Задайте ваш вопрос:',
             reply_markup=get_cancel_keyboard()
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить запрос вопроса user_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -258,7 +275,8 @@ async def newsletter(message: types.Message, state: FSMContext):
             text='Введите текст рассылки:',
             reply_markup=get_cancel_keyboard()
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить запрос текста рассылки admin_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -270,7 +288,8 @@ async def change_about_us(message: types.Message, state: FSMContext):
 
     try:
         await message.answer(text='Напишите описание вашего сервиса и предоставляемых вами услуг:')
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить запрос нового описания admin_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -282,7 +301,8 @@ async def change_price(message: types.Message, state: FSMContext):
 
     try:
         await message.answer(text='Напишите ваш прайс:')
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить запрос нового прайса admin_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -349,7 +369,8 @@ async def admin_instruction(message: types.Message):
             text=instruction,
             reply_markup=get_admin_keyboard()
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить инструкцию admin_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -374,14 +395,16 @@ async def menu(message: types.Message, state: FSMContext):
                 f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
                 f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
                 reply_markup=get_main_keyboard())
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось отправить меню user_id=%s: %s", user.id, error)
             pass
 
         return
 
     try:
         await message.answer(text='Вы в меню.', reply_markup=get_admin_keyboard())
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить меню администратору user_id=%s: %s", user.id, error)
         pass
 
 
@@ -401,7 +424,8 @@ async def back(message: types.Message, state: FSMContext):
                 f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
                 f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
                 reply_markup=get_main_keyboard())
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось отправить меню (Назад) user_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -430,7 +454,8 @@ async def reply_to_message(message: types.Message, bot: Bot):
     if group_id is None:
         try:
             await message.answer(text='Бот не привязан к группе!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось уведомить админа об отсутствии привязки группы admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -438,7 +463,8 @@ async def reply_to_message(message: types.Message, bot: Bot):
     if group_id != message.chat.id:
         try:
             await message.answer(text='Бот привязан к другой группе!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось уведомить админа о несовпадении группы admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -459,7 +485,8 @@ async def reply_to_message(message: types.Message, bot: Bot):
     if not user_id:
         try:
             await message.answer(text='Данный пользователь не зарегистрирован в боте!')
-        except TelegramBadRequest:
+        except TelegramBadRequest as error:
+            logger.warning("Не удалось уведомить админа о незарегистрированном пользователе thread_id=%s: %s", message.message_thread_id, error)
             pass
 
         return
@@ -478,11 +505,13 @@ async def reply_to_message(message: types.Message, bot: Bot):
     try:
         await bot.send_message(chat_id=user_id, text=context_text)
         await message.copy_to(chat_id=user_id)
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.error("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
         await message.answer(
             text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.'
         )
-    except (TelegramBadRequest, TelegramRetryAfter):
+    except (TelegramBadRequest, TelegramRetryAfter) as error:
+        logger.error("Доставка ответа админа пользователю user_id=%s не удалась: %s", user_id, error)
         await message.answer(
             text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.'
         )
@@ -571,7 +600,8 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         if topic_name is None:
             try:
                 await message.answer(text='Вы не зарегистрированы в боте. Напишите /start')
-            except TelegramForbiddenError:
+            except TelegramForbiddenError as error:
+                logger.warning("Не удалось уведомить о необходимости /start (заявка) user_id=%s: %s", user.id, error)
                 pass
             return
 
@@ -612,7 +642,8 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
             await message.answer(
                 text='Произошла ошибка на стороне сервера. Пожалуйста, напишите /start'
             )
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить об ошибке сохранения заявки user_id=%s: %s", user.id, error)
             pass
         return
 
@@ -626,7 +657,8 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
                 "<i>Чтобы написать еще раз, выберите действие в меню.</i>"),
             reply_markup=get_main_keyboard()
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось уведомить об успешной отправке заявки user_id=%s: %s", user.id, error)
         pass
 
 
@@ -637,7 +669,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
     if not message or not message.text:
         try:
             await message.answer(text='Текст не распознан. Пожалуйста, напишите вопрос текстом!')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить о нераспознанном тексте вопроса user_id=%s: %s", message.from_user.id, error)
             pass
         return
 
@@ -654,7 +687,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
     if group_id is None:
         try:
             await message.answer(text='Ошибка на сервере. Попробуйте позже.')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить об ошибке сервера (вопрос) user_id=%s: %s", user.id, error)
             pass
         return
 
@@ -666,7 +700,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         if topic_name is None:
             try:
                 await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
-            except TelegramForbiddenError:
+            except TelegramForbiddenError as error:
+                logger.warning("Не удалось уведомить о необходимости /start (вопрос) user_id=%s: %s", user.id, error)
                 pass
             return
 
@@ -683,7 +718,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         if not status:
             try:
                 await message.answer(text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start')
-            except TelegramForbiddenError:
+            except TelegramForbiddenError as error:
+                logger.warning("Не удалось уведомить о необходимости /start после ошибки создания темы user_id=%s: %s", user.id, error)
                 pass
             return
 
@@ -704,7 +740,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             await message.answer(
                 text='Произошла ошибка на стороне сервера. Пожалуйста, напишите /start'
             )
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить об ошибке сохранения вопроса user_id=%s: %s", user.id, error)
             pass
         return
 
@@ -718,7 +755,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
                 "<i>Чтобы написать еще раз, выберите действие в меню.</i>"),
             reply_markup=get_main_keyboard()
         )
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось уведомить об успешной отправке вопроса user_id=%s: %s", user.id, error)
         pass
 
 
@@ -729,7 +767,8 @@ async def send_newsletter(message: types.Message, state: FSMContext):
     if not message or not message.text:
         try:
             await message.answer(text='Текст не распознан. Пожалуйста, напишите текст снова.')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить админа о нераспознанном тексте рассылки admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -737,7 +776,8 @@ async def send_newsletter(message: types.Message, state: FSMContext):
     if len(message.text) > 4096:
         try:
             await message.answer(text='Ваше сообщение слишком длинное! Пожалуйста, учтите ограничение в 4096 символов.')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить админа о превышении длины рассылки admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -750,7 +790,8 @@ async def send_newsletter(message: types.Message, state: FSMContext):
                                   f'Вот так выглядит ваше сообщение сейчас:\n',
                              reply_markup=get_sure_keyboard())
         await message.answer(text=f'{html.escape(message.text)}')
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить предпросмотр рассылки admin_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -761,7 +802,8 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
     if not message or not message.text or message.text not in ['Подтвердить', 'Изменить']:
         try:
             await message.answer(text='Такого варианта нету!')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить админа о некорректном варианте admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -776,7 +818,8 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
             try:
                 await  message.answer(text='У бота нету пользователей. Пока что сделать рассылку нельзя.',
                                       reply_markup=get_admin_keyboard())
-            except TelegramForbiddenError:
+            except TelegramForbiddenError as error:
+                logger.warning("Не удалось уведомить админа об отсутствии пользователей admin_id=%s: %s", message.from_user.id, error)
                 pass
 
             return
@@ -790,7 +833,8 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
                     await bot.send_message(chat_id=telegram_id,
                                            text=html.escape(data['newsletter']), reply_markup=get_main_keyboard())
                     sent += 1
-                except TelegramForbiddenError:
+                except TelegramForbiddenError as error:
+                    logger.info("Рассылка: доставка пользователю user_id=%s не удалась (заблокировал бота): %s", telegram_id, error)
                     not_sent += 1
                     await deactivated_user(telegram_id)
                 except (TelegramBadRequest, TelegramRetryAfter):
@@ -805,7 +849,8 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
                      f'Активных из них: {sent + not_sent}',
                 reply_markup=get_admin_keyboard()
             )
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось отправить итоги рассылки admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -818,7 +863,8 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
                 text='Введите текст рассылки:',
                 reply_markup=get_cancel_keyboard()
             )
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось отправить повторный запрос текста рассылки admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -831,7 +877,8 @@ async def set_about_us(message: types.Message, state: FSMContext):
     if not message or not message.text:
         try:
             await message.answer(text='⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше описание:</i>')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить о нераспознанном тексте 'О нас' admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -846,7 +893,8 @@ async def set_about_us(message: types.Message, state: FSMContext):
     if not status:
         try:
             await message.answer(text='Текст не был сохранен! Пожалуйста, попробуйте снова.')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить об ошибке сохранения 'О нас' admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -854,7 +902,8 @@ async def set_about_us(message: types.Message, state: FSMContext):
     try:
         await message.answer(text='Текст был успешно изменен!',
                              reply_markup=get_admin_keyboard())
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось уведомить об успешном изменении 'О нас' admin_id=%s: %s", message.from_user.id, error)
         pass
 
 
@@ -865,7 +914,8 @@ async def set_price_text(message: types.Message, state: FSMContext):
     if message.text is None:
         try:
             await message.answer(text='⚠️ <i>Текст не распознан. Пожалуйста, напишите ваш прайс:</i>')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить о нераспознанном тексте прайса admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -880,7 +930,8 @@ async def set_price_text(message: types.Message, state: FSMContext):
     if not status:
         try:
             await message.answer(text='Прайс не был сохранен! Пожалуйста, попробуйте снова.')
-        except TelegramForbiddenError:
+        except TelegramForbiddenError as error:
+            logger.warning("Не удалось уведомить об ошибке сохранения прайса admin_id=%s: %s", message.from_user.id, error)
             pass
 
         return
@@ -888,5 +939,6 @@ async def set_price_text(message: types.Message, state: FSMContext):
     try:
         await message.answer(text='Прайс был успешно изменен!',
                              reply_markup=get_admin_keyboard())
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось уведомить об успешном изменении прайса admin_id=%s: %s", message.from_user.id, error)
         pass
