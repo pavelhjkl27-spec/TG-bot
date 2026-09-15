@@ -35,6 +35,23 @@ router = Router()
 NAME_MAX_LENGTH = 200
 BIRTHDAY_FORMAT = '%d/%m/%Y'
 
+SET_THREAD_ID_ATTEMPTS = 3
+SET_THREAD_ID_RETRY_DELAY_SECONDS = 0.5
+SAVE_APPEAL_ATTEMPTS = 3
+SAVE_APPEAL_RETRY_DELAY_SECONDS = 0.5
+
+_pending_topic_ids: dict[int, int] = {}
+"""
+Тема, которая реально создана в Telegram, но ещё не подтверждена записью в
+Users.topic_id из-за сбоя set_user_thread_id (даже после ретраев). Пока
+процесс бота жив, следующая попытка того же клиента переиспользует этот
+topic_id вместо создания ещё одной темы в группе — не более одной
+осиротевшей темы на клиента за инцидент, а не по одной на каждый повтор.
+Как и FSM-хранилка бота (тоже in-memory), это состояние не переживает
+перезапуск процесса — приемлемый компромисс, раз без похода в ту же самую
+недоступную сейчас БД персистентную альтернативу всё равно не сделать.
+"""
+
 
 class TopicResolutionError(Exception):
     """
@@ -54,37 +71,68 @@ async def resolve_client_topic(bot: Bot, user: types.User, group_id: int) -> int
     topic_id = await get_user_thread_id(user.id)
 
     if topic_id is not None:
+        _pending_topic_ids.pop(user.id, None)
         return topic_id
 
-    topic_name = await get_topic_name(user.id)
+    topic_id = _pending_topic_ids.get(user.id)
 
-    if topic_name is None:
-        raise TopicResolutionError('not_registered')
+    if topic_id is None:
+        topic_name = await get_topic_name(user.id)
 
-    try:
-        topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
-    except (TelegramBadRequest, TelegramRetryAfter):
-        raise TopicResolutionError('telegram_error')
+        if topic_name is None:
+            raise TopicResolutionError('not_registered')
 
-    topic_id = topic.message_thread_id
+        try:
+            topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
+        except (TelegramBadRequest, TelegramRetryAfter):
+            raise TopicResolutionError('telegram_error')
 
-    try:
-        status = await set_user_thread_id(user.id, topic_id)
-    except SQLAlchemyError as error:
+        topic_id = topic.message_thread_id
+    else:
+        logger.info(
+            "Переиспользуем ранее созданную тему topic_id=%s для user_id=%s вместо повторного "
+            "создания (прошлая попытка привязать её в БД не удалась)",
+            topic_id, user.id
+        )
+
+    status = None
+    link_error = None
+
+    for attempt in range(1, SET_THREAD_ID_ATTEMPTS + 1):
+        try:
+            status = await set_user_thread_id(user.id, topic_id)
+            link_error = None
+            break
+        except SQLAlchemyError as error:
+            link_error = error
+
+            if attempt < SET_THREAD_ID_ATTEMPTS:
+                logger.warning(
+                    "Не удалось привязать topic_id=%s к user_id=%s (попытка %s/%s), повтор через %sс: %s",
+                    topic_id, user.id, attempt, SET_THREAD_ID_ATTEMPTS,
+                    SET_THREAD_ID_RETRY_DELAY_SECONDS, error
+                )
+                await asyncio.sleep(SET_THREAD_ID_RETRY_DELAY_SECONDS)
+
+    if link_error is not None:
+        _pending_topic_ids[user.id] = topic_id
         logger.error(
             "Тема topic_id=%s создана в Telegram для user_id=%s, но привязать её в БД не удалось "
-            "(ошибка БД) — тема осиротела: %s",
-            topic_id, user.id, error
+            "после %s попыток (ошибка БД) — тема временно осиротела; следующая попытка клиента "
+            "переиспользует этот topic_id вместо создания новой: %s",
+            topic_id, user.id, SET_THREAD_ID_ATTEMPTS, link_error
         )
         raise TopicResolutionError('db_error')
 
     if not status:
+        _pending_topic_ids.pop(user.id, None)
         logger.error(
             "Тема topic_id=%s создана в Telegram, но не привязана к user_id=%s (пользователь не найден) — тема осиротела",
             topic_id, user.id
         )
         raise TopicResolutionError('not_registered')
 
+    _pending_topic_ids.pop(user.id, None)
     return topic_id
 
 
@@ -135,13 +183,31 @@ async def _deliver_client_submission(
         await safe_answer(message, context=f'уведомление о недоставке user_id={user.id}', text=undelivered_text)
         return
 
-    try:
-        result = await save_user_appeal(user.id, save_text, appeal_type, name=name, birthday=birthday)
-    except SQLAlchemyError as error:
+    result = None
+    save_error = None
+
+    for attempt in range(1, SAVE_APPEAL_ATTEMPTS + 1):
+        try:
+            result = await save_user_appeal(user.id, save_text, appeal_type, name=name, birthday=birthday)
+            save_error = None
+            break
+        except SQLAlchemyError as error:
+            save_error = error
+
+            if attempt < SAVE_APPEAL_ATTEMPTS:
+                logger.warning(
+                    "Не удалось сохранить обращение (type=%s) для user_id=%s в БД (попытка %s/%s), "
+                    "повтор через %sс: %s",
+                    appeal_type, user.id, attempt, SAVE_APPEAL_ATTEMPTS,
+                    SAVE_APPEAL_RETRY_DELAY_SECONDS, error
+                )
+                await asyncio.sleep(SAVE_APPEAL_RETRY_DELAY_SECONDS)
+
+    if save_error is not None:
         logger.error(
             "Обращение (type=%s) отправлено в группу, но не сохранено в БД для user_id=%s "
-            "(ошибка БД): %s",
-            appeal_type, user.id, error
+            "после %s попыток (ошибка БД): %s",
+            appeal_type, user.id, SAVE_APPEAL_ATTEMPTS, save_error
         )
         await safe_answer(
             message,
