@@ -3,6 +3,36 @@ from app.database import async_session_maker
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select
 
+_SETTINGS_QUERY = select(Settings).where(Settings.id == 1)
+
+
+async def _get_or_create_settings(session, **create_fields):
+    """
+    Возвращает (setting, created) для строки Settings(id=1), создавая её
+    при отсутствии. При гонке на INSERT (IntegrityError) делает повторный
+    SELECT — setting может оказаться None, если строка так и не появилась.
+    """
+    result = await session.execute(_SETTINGS_QUERY)
+    setting = result.scalar_one_or_none()
+
+    if setting is not None:
+        return setting, False
+
+    entry = Settings(id=1, **create_fields)
+    session.add(entry)
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+
+        result = await session.execute(_SETTINGS_QUERY)
+        setting = result.scalar_one_or_none()
+
+        return setting, False
+    else:
+        return entry, True
+
 
 async def add_user(user_id):
     query = select(Users).where(Users.telegram_id == user_id)
@@ -112,10 +142,8 @@ async def get_user_id(message_thread_id):
 
 
 async def get_group_id():
-    query = select(Settings).where(Settings.id == 1)
-
     async with async_session_maker() as session:
-        result = await session.execute(query)
+        result = await session.execute(_SETTINGS_QUERY)
 
         setting = result.scalar_one_or_none()
 
@@ -129,29 +157,14 @@ async def get_group_id():
 
 
 async def save_group_id(group_id):
-    query = select(Settings).where(Settings.id == 1)
-
     async with async_session_maker() as session:
-        result = await session.execute(query)
-
-        setting = result.scalar_one_or_none()
+        setting, created = await _get_or_create_settings(session, group_id=group_id)
 
         if setting is None:
-            entry = Settings(id=1, group_id=group_id)
-            session.add(entry)
+            return False
 
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-
-                result = await session.execute(query)
-                setting = result.scalar_one_or_none()
-
-                if setting is None:
-                    return False
-            else:
-                return True
+        if created:
+            return True
 
         if setting.group_id is not None:
             if setting.group_id != group_id:
@@ -166,10 +179,8 @@ async def save_group_id(group_id):
 
 
 async def get_about_us():
-    query = select(Settings).where(Settings.id == 1)
-
     async with async_session_maker() as session:
-        result = await session.execute(query)
+        result = await session.execute(_SETTINGS_QUERY)
 
         setting = result.scalar_one_or_none()
 
@@ -183,10 +194,8 @@ async def get_about_us():
 
 
 async def get_price():
-    query = select(Settings).where(Settings.id == 1)
-
     async with async_session_maker() as session:
-        result = await session.execute(query)
+        result = await session.execute(_SETTINGS_QUERY)
 
         setting = result.scalar_one_or_none()
 
@@ -247,29 +256,14 @@ async def deactivated_user(user_id):
 
 
 async def set_about_us_text(about_us_text):
-    query = select(Settings).where(Settings.id == 1)
-
     async with async_session_maker() as session:
-        result = await session.execute(query)
-
-        setting = result.scalar_one_or_none()
+        setting, created = await _get_or_create_settings(session, group_id=None, about_us_text=about_us_text)
 
         if setting is None:
-            entry = Settings(id=1, group_id=None, about_us_text=about_us_text)
-            session.add(entry)
+            return False
 
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-
-                result = await session.execute(query)
-                setting = result.scalar_one_or_none()
-
-                if setting is None:
-                    return False
-            else:
-                return True
+        if created:
+            return True
 
         setting.about_us_text = about_us_text
         await session.commit()
@@ -278,29 +272,14 @@ async def set_about_us_text(about_us_text):
 
 
 async def set_price(price):
-    query = select(Settings).where(Settings.id == 1)
-
     async with async_session_maker() as session:
-        result = await session.execute(query)
-
-        setting = result.scalar_one_or_none()
+        setting, created = await _get_or_create_settings(session, group_id=None, price_text=price)
 
         if setting is None:
-            entry = Settings(id=1, group_id=None, price_text=price)
-            session.add(entry)
+            return False
 
-            try:
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-
-                result = await session.execute(query)
-                setting = result.scalar_one_or_none()
-
-                if setting is None:
-                    return False
-            else:
-                return True
+        if created:
+            return True
 
         setting.price_text = price
         await session.commit()

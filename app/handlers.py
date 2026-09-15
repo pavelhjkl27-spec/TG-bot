@@ -6,6 +6,7 @@ import logging
 from aiogram import Router, types, F, Bot
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -86,6 +87,29 @@ async def resolve_client_topic(bot: Bot, user: types.User, group_id: int) -> int
     return topic_id
 
 
+WELCOME_MENU_TEXT = (
+    "👋 <b>Добро пожаловать!</b>\n\n"
+    "💰 Наш текущий прайс:\n<b>{price}</b>\n\n"
+    "👇 <i>Выберите нужное действие в меню ниже:</i>"
+)
+DEFAULT_PRICE_FALLBACK = 'Прайс уточняется у администратора.'
+
+
+async def send_welcome_menu(message: types.Message, log_context: str) -> None:
+    price = await get_price()
+
+    if price is None:
+        price = DEFAULT_PRICE_FALLBACK
+
+    try:
+        await message.answer(
+            text=WELCOME_MENU_TEXT.format(price=html.escape(price)),
+            reply_markup=get_main_keyboard()
+        )
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить %s user_id=%s: %s", log_context, message.from_user.id, error)
+
+
 @router.message(CommandStart(), F.chat.type == 'private')
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -96,25 +120,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
 
     if user.id != Config.ADMIN_ID:
-
-        keyboard = get_main_keyboard()
-
         await add_user(user.id)
-
-        price = await get_price()
-
-        if price is None:
-            price = 'Прайс уточняется у администратора.'
-
-        try:
-            await message.answer(text=(
-                f"👋 <b>Добро пожаловать!</b>\n\n"
-                f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
-                f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
-                reply_markup=keyboard)
-        except TelegramForbiddenError as error:
-            logger.warning("Не удалось отправить приветствие user_id=%s: %s", user.id, error)
-            pass
+        await send_welcome_menu(message, 'приветствие')
 
         return
 
@@ -269,7 +276,12 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
 @router.my_chat_member(ChatMemberUpdatedFilter(IS_MEMBER >> IS_NOT_MEMBER),
                     F.chat.type == 'private')
 async def bot_removed_from_chat(event: types.ChatMemberUpdated):
-    await deactivated_user(event.from_user.id)
+    user = event.from_user
+
+    if user is None:
+        return
+
+    await deactivated_user(user.id)
 
 
 @router.message(F.text == 'Оставить заявку',
@@ -461,20 +473,7 @@ async def menu(message: types.Message, state: FSMContext):
         return
 
     if user.id != Config.ADMIN_ID:
-        price = await get_price()
-
-        if price is None:
-            price = 'Прайс уточняется у администратора.'
-
-        try:
-            await message.answer(text=(
-                f"👋 <b>Добро пожаловать!</b>\n\n"
-                f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
-                f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
-                reply_markup=get_main_keyboard())
-        except TelegramForbiddenError as error:
-            logger.warning("Не удалось отправить меню user_id=%s: %s", user.id, error)
-            pass
+        await send_welcome_menu(message, 'меню')
 
         return
 
@@ -485,25 +484,14 @@ async def menu(message: types.Message, state: FSMContext):
         pass
 
 
-@router.message(F.text == 'Назад', F.chat.type == 'private')
+@router.message(F.text == 'Назад',
+                F.chat.type == 'private',
+                StateFilter(None, Form.text, Form.birthday))
 async def back(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
 
     if current_state is None:
-        price = await get_price()
-
-        if price is None:
-            price = 'Прайс уточняется у администратора.'
-
-        try:
-            await message.answer(text=(
-                f"👋 <b>Добро пожаловать!</b>\n\n"
-                f"💰 Наш текущий прайс:\n<b>{html.escape(price)}</b>\n\n"
-                f"👇 <i>Выберите нужное действие в меню ниже:</i>"),
-                reply_markup=get_main_keyboard())
-        except TelegramForbiddenError as error:
-            logger.warning("Не удалось отправить меню (Назад) user_id=%s: %s", message.from_user.id, error)
-            pass
+        await send_welcome_menu(message, 'меню (Назад)')
 
         return
 
@@ -959,9 +947,13 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
 
         for telegram_id, is_active in users:
             if is_active:
+                recipient_key = StorageKey(bot_id=bot.id, chat_id=telegram_id, user_id=telegram_id)
+                recipient_state = await state.storage.get_state(recipient_key)
+                keyboard = get_main_keyboard() if recipient_state is None else None
+
                 try:
                     await bot.send_message(chat_id=telegram_id,
-                                           text=html.escape(data['newsletter']), reply_markup=get_main_keyboard())
+                                           text=html.escape(data['newsletter']), reply_markup=keyboard)
                     sent += 1
                 except TelegramForbiddenError as error:
                     logger.info("Рассылка: доставка пользователю user_id=%s не удалась (заблокировал бота): %s", telegram_id, error)
