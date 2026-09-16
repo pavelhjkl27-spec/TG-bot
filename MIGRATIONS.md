@@ -128,7 +128,10 @@ docker compose logs --tail 30 bot
 docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT (SELECT count(*) FROM users) AS users, (SELECT count(*) FROM requests) AS requests, (SELECT version_num FROM alembic_version) AS alembic;"'
 ```
 
-Эта процедура нужна **один раз**. Дальше миграции накатываются сами при старте бота.
+Эта процедура нужна **один раз**. Дальше миграции накатываются сами при старте бота, а деплой идёт
+через `scripts/deploy.sh` (`DEPLOY.md`). `docker compose build bot` в шаге 2.1 собирает `bot:current` без
+sha-тега, поэтому откатиться на этот образ через `rollback.sh` нельзя. Первый `deploy.sh` после разметки
+создаст нормальный тегированный образ.
 
 ---
 
@@ -180,19 +183,18 @@ python -m e2e.run_e2e      # e2e сам пересоздаёт схему чер
 
 ### 3.4. Выкатить на прод
 
+Обычным деплоем — `DEPLOY.md`:
+
 ```bash
 cd /opt/PythonProject
-git pull
-docker compose build bot
-./scripts/backup_db.sh                 # бэкап перед любым изменением схемы
-docker compose up -d bot               # upgrade head выполнится при старте
-docker compose logs --tail 30 bot      # Database migrations applied
+./scripts/deploy.sh                    # сам сделает бэкап и предупредит: "применится миграция схемы: X -> Y"
 docker compose run --rm bot alembic current
 ```
 
 Миграция идёт в одной транзакции (DDL в Postgres транзакционный): если она упала, схема остаётся
-прежней, а бот не стартует, и ошибка видна в логах и в Sentry. Исправьте миграцию, пересоберите и
-перезапустите.
+прежней, а бот не стартует, и ошибка видна в логах и в Sentry. `deploy.sh` покажет, что деплой не
+поднялся. Откат образа (`rollback.sh`) схему **не** откатывает — если миграция применилась, а код
+оказался плохим, порядок действий в `DEPLOY.md`, раздел «Откат».
 
 ### Не делайте
 

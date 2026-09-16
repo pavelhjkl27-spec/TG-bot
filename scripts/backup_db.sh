@@ -13,6 +13,8 @@
 # Переменные окружения (все необязательные):
 #   BACKUP_DIR                каталог для архивов (по умолчанию <проект>/backups)
 #   BACKUP_RETENTION_DAYS     сколько дней хранить локальные архивы (по умолчанию 14)
+#   BACKUP_LABEL              метка в имени файла: backup-YYYY-MM-DD-HHMMSS-<метка>.sql.gz
+#                             (deploy.sh передаёт predeploy-<sha>); без неё — backup-YYYY-MM-DD.sql.gz
 #   BACKUP_REMOTE_ENABLED     "true" — включить выгрузку через rclone (по умолчанию выключено)
 #   BACKUP_RCLONE_REMOTE      имя remote из `rclone config` (например "b2")
 #   BACKUP_RCLONE_PATH        bucket/путь внутри remote (например "my-bot-backups/db")
@@ -47,7 +49,15 @@ if command -v flock >/dev/null 2>&1; then
     flock -n 9 || fail "другой бэкап уже выполняется"
 fi
 
-STAMP="$(date +%F)"
+# Без BACKUP_LABEL (ежедневный cron) — один архив на день, повторный запуск за день его перезаписывает.
+# С BACKUP_LABEL (deploy.sh, ручные бэкапы) — уникальное имя со временем, чтобы, например, бэкап перед
+# вторым деплоем за день не затёр бэкап, сделанный до миграции первого.
+if [[ -n "${BACKUP_LABEL:-}" ]]; then
+    [[ "$BACKUP_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || fail "BACKUP_LABEL: только латиница, цифры, '.', '_', '-'"
+    STAMP="$(date +%F-%H%M%S)-$BACKUP_LABEL"
+else
+    STAMP="$(date +%F)"
+fi
 FINAL_FILE="$BACKUP_DIR/backup-$STAMP.sql.gz"
 TMP_FILE="$FINAL_FILE.partial"
 # Если что-то упадёт до mv — не оставляем полузаписанный файл

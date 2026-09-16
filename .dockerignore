@@ -19,3 +19,4 @@ __MACOSX/
 *.zip
 
 backups/
+.deploy_history

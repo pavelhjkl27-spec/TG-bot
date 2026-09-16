@@ -15,3 +15,6 @@ e2e/
 
 # DB backups (real client data)
 backups/
+
+# Журнал деплоев/откатов на VPS (scripts/deploy.sh, scripts/rollback.sh)
+.deploy_history

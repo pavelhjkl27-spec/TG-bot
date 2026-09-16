@@ -29,6 +29,10 @@ services:
       context: .
       dockerfile: Dockerfile
 
+    # bot:<git sha> — образ конкретного деплоя, bot:current — задеплоенный сейчас.
+    # Теги переставляют scripts/deploy.sh и scripts/rollback.sh (см. DEPLOY.md).
+    image: ${BOT_IMAGE:-bot}:${BOT_TAG:-current}
+
     restart: unless-stopped
 
     logging:

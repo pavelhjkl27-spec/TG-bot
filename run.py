@@ -225,6 +225,12 @@ async def main():
     else:
         logger.info('HEARTBEAT_URL не задан — heartbeat отключён')
 
+    # Проверка токена и связи с Telegram до polling: `bot.me()` кэширует ответ, и start_polling его
+    # переиспользует. По строке 'Bot is ready' scripts/deploy_common.sh (BOT_READY_MARKER) понимает,
+    # что бот после деплоя действительно поднялся — меняете текст, поменяйте и там.
+    me = await bot.me()
+    logger.info('Bot is ready: @%s', me.username)
+
     await dp.start_polling(bot)
 
 
