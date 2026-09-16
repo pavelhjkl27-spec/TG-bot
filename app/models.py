@@ -26,6 +26,7 @@ class Requests(Base):
     name = Column(Text, nullable=True)
     birthday = Column(String(10), nullable=True)
     text = Column(Text, nullable=False)
+    group_message_id = Column(Integer, unique=True, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda _: datetime.now(timezone.utc))
 
     user = relationship('Users', back_populates='requests')

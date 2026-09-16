@@ -4,6 +4,7 @@ import html
 import logging
 
 from aiogram import Router, types, F, Bot
+from aiogram.enums import ContentType
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -25,7 +26,7 @@ from app.db_requests import (add_user,
                              get_about_us, get_users,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
-                             set_price)
+                             set_price, get_request_text_by_group_message_id)
 from app.utils import exceeds_telegram_limit, safe_answer, safe_send_message
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,18 @@ SET_THREAD_ID_ATTEMPTS = 3
 SET_THREAD_ID_RETRY_DELAY_SECONDS = 0.5
 SAVE_APPEAL_ATTEMPTS = 3
 SAVE_APPEAL_RETRY_DELAY_SECONDS = 0.5
+
+CLIENT_QUOTE_MAX_LENGTH = 150
+LEGACY_QUOTE_MAX_LENGTH = 2500
+
+# Типы контента, для которых Bot API вообще поддерживает caption у copyMessage —
+# для остальных (стикеры, video_note и т.п.) caption физически некуда передать.
+CAPTION_CAPABLE_CONTENT_TYPES = {
+    ContentType.DOCUMENT, ContentType.PHOTO, ContentType.VIDEO,
+    ContentType.AUDIO, ContentType.VOICE, ContentType.ANIMATION,
+}
+DOCUMENT_FALLBACK_CAPTION = 'Ваш разбор готов, файл прикреплён ниже 📎'
+NEUTRAL_FALLBACK_CAPTION = 'Сообщение от администратора'
 
 _pending_topic_ids: dict[int, int] = {}
 """
@@ -173,13 +186,13 @@ async def _deliver_client_submission(
         await safe_answer(message, context=f'невозможность создать тему user_id={user.id}', text=text)
         return
 
-    delivered = await safe_send_message(
+    delivered_message = await safe_send_message(
         bot, group_id,
         context=f'обращение (type={appeal_type}) в группу user_id={user.id} topic_id={topic_id}',
         text=final_text, message_thread_id=topic_id
     )
 
-    if not delivered:
+    if not delivered_message:
         await safe_answer(message, context=f'уведомление о недоставке user_id={user.id}', text=undelivered_text)
         return
 
@@ -188,7 +201,10 @@ async def _deliver_client_submission(
 
     for attempt in range(1, SAVE_APPEAL_ATTEMPTS + 1):
         try:
-            result = await save_user_appeal(user.id, save_text, appeal_type, name=name, birthday=birthday)
+            result = await save_user_appeal(
+                user.id, save_text, appeal_type, name=name, birthday=birthday,
+                group_message_id=delivered_message.message_id
+            )
             save_error = None
             break
         except SQLAlchemyError as error:
@@ -701,15 +717,6 @@ async def reply_to_message(message: types.Message, bot: Bot):
         )
         return
 
-    if not original_message.text:
-        await safe_answer(
-            message,
-            context=f'reply на нетекстовое сообщение бота admin_id={message.from_user.id}',
-            text='Сообщение, на которое вы ответили, не содержит текста. Чтобы ответ дошёл клиенту, '
-                 'используйте Reply на текстовое сообщение бота с заявкой или вопросом клиента.'
-        )
-        return
-
     user_id = await get_user_id(message.message_thread_id)
 
     if not user_id:
@@ -721,16 +728,40 @@ async def reply_to_message(message: types.Message, bot: Bot):
 
         return
 
-    original_text = original_message.text
+    client_appeal_text = await get_request_text_by_group_message_id(original_message.message_id)
 
-    if len(original_text) > 2500:
-        original_text = original_text[:2500] + '…'
+    if client_appeal_text is not None:
+        quoted_text = client_appeal_text
 
-    context_text = (
-        f"📩 <b>Ответ администратора на ваше обращение:</b>\n"
-        f"<i>{html.escape(original_text)}</i>\n\n"
-        f"💬 <b>Сообщение администратора:</b>"
-    )
+        if len(quoted_text) > CLIENT_QUOTE_MAX_LENGTH:
+            quoted_text = quoted_text[:CLIENT_QUOTE_MAX_LENGTH] + '…'
+
+        context_text = f"📩 Ответ на ваше обращение «{html.escape(quoted_text)}»:"
+    else:
+        # Временный fallback: у обращений, созданных ДО появления Requests.group_message_id,
+        # это поле NULL, поэтому найти исходный текст клиента по id карточки в группе
+        # невозможно — откатываемся на старое поведение (разбор текста самой карточки).
+        # Как только такие "старые" обращения перестанут быть актуальными, эту ветку и
+        # проверку ниже можно будет убрать вместе с этим комментарием.
+        if not original_message.text:
+            await safe_answer(
+                message,
+                context=f'reply на нетекстовое сообщение бота admin_id={message.from_user.id}',
+                text='Сообщение, на которое вы ответили, не содержит текста. Чтобы ответ дошёл клиенту, '
+                     'используйте Reply на текстовое сообщение бота с заявкой или вопросом клиента.'
+            )
+            return
+
+        original_text = original_message.text
+
+        if len(original_text) > LEGACY_QUOTE_MAX_LENGTH:
+            original_text = original_text[:LEGACY_QUOTE_MAX_LENGTH] + '…'
+
+        context_text = (
+            f"📩 <b>Ответ администратора на ваше обращение:</b>\n"
+            f"<i>{html.escape(original_text)}</i>\n\n"
+            f"💬 <b>Сообщение администратора:</b>"
+        )
 
     try:
         await bot.send_message(chat_id=user_id, text=context_text)
@@ -745,12 +776,31 @@ async def reply_to_message(message: types.Message, bot: Bot):
                            text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.')
         return
 
+    copy_kwargs = {}
+    followup_caption = None
+
+    if not message.text and not message.caption:
+        fallback_caption = (
+            DOCUMENT_FALLBACK_CAPTION if message.content_type == ContentType.DOCUMENT
+            else NEUTRAL_FALLBACK_CAPTION
+        )
+
+        if message.content_type in CAPTION_CAPABLE_CONTENT_TYPES:
+            copy_kwargs['caption'] = fallback_caption
+        else:
+            # Telegram не поддерживает caption для этого типа контента (стикеры,
+            # video_note и т.п.) ни в copyMessage, ни в исходном методе отправки —
+            # подставить его некуда, поэтому шлём тем же нейтральным текстом отдельным
+            # сообщением следом за успешной копией.
+            followup_caption = fallback_caption
+
     try:
-        await message.copy_to(chat_id=user_id)
+        await message.copy_to(chat_id=user_id, **copy_kwargs)
     except TelegramForbiddenError as error:
         logger.error("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
         await safe_answer(message, context=f'уведомление о блокировке (содержимое) admin_id={message.from_user.id}',
                            text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.')
+        return
     except TelegramAPIError as error:
         logger.error(
             "Доставка содержимого ответа админа пользователю user_id=%s не удалась после отправки заголовка: %s",
@@ -764,6 +814,14 @@ async def reply_to_message(message: types.Message, bot: Bot):
             context=f'уведомление клиента о частичной недоставке user_id={user_id}',
             text='⚠️ К сожалению, основное содержимое ответа администратора не удалось доставить. '
                  'Пожалуйста, напишите нам ещё раз, если вопрос остался открытым.'
+        )
+        return
+
+    if followup_caption is not None:
+        await safe_send_message(
+            bot, user_id,
+            context=f'подпись к содержимому без caption user_id={user_id}',
+            text=followup_caption
         )
 
 
@@ -907,9 +965,10 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         not_registered_text='Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.',
         undelivered_text='Ваша заявка не была доставлена. Попробуйте отправить её ещё раз чуть позже.',
         success_text=(
-            "✅ <b>Ваша заявка успешно отправлена!</b>\n\n"
-            "Администратор ознакомится с ней и ответит вам прямо здесь.\n\n"
-            "<i>Чтобы написать еще раз, выберите действие в меню.</i>"
+            "✅ <b>Заявка отправлена!</b>\n\n"
+            "Мы получили её и свяжемся с вами лично, как только разбор будет готов — "
+            "это может занять некоторое время.\n\n"
+            "<i>Чтобы отправить ещё одну заявку или задать вопрос, воспользуйтесь меню.</i>"
         ),
     )
 
@@ -968,9 +1027,9 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         not_registered_text='Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.',
         undelivered_text='Ваш вопрос не был доставлен. Попробуйте отправить его ещё раз чуть позже.',
         success_text=(
-            "✅ <b>Ваш вопрос успешно отправлен!</b>\n\n"
-            "Администратор ознакомится с ним и ответит вам прямо здесь.\n\n"
-            "<i>Чтобы написать еще раз, выберите действие в меню.</i>"
+            "✅ <b>Вопрос отправлен!</b>\n\n"
+            "Администратор ответит вам прямо здесь, как только сможет.\n\n"
+            "<i>Чтобы отправить ещё одно сообщение, воспользуйтесь меню.</i>"
         ),
     )
 

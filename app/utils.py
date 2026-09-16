@@ -6,6 +6,7 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
+from aiogram.types import Message
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +52,14 @@ async def safe_answer(message, *, context: str, **answer_kwargs) -> bool:
         return False
 
 
-async def safe_send_message(bot, chat_id, *, context: str, **send_kwargs) -> bool:
-    """То же самое, что safe_answer, но через bot.send_message(chat_id=...)."""
+async def safe_send_message(bot, chat_id, *, context: str, **send_kwargs) -> Message | None:
+    """
+    То же самое, что safe_answer, но через bot.send_message(chat_id=...).
+    Возвращает отправленный Message при успехе (используется, например, чтобы
+    сохранить message_id отправленной в группу карточки) и None при неудаче.
+    """
     try:
-        await bot.send_message(chat_id=chat_id, **send_kwargs)
-        return True
+        return await bot.send_message(chat_id=chat_id, **send_kwargs)
     except TelegramAPIError as error:
         _log_send_failure(context, error)
-        return False
+        return None

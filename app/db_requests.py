@@ -53,7 +53,7 @@ async def add_user(user_id):
         await session.commit()
 
 
-async def save_user_appeal(user_id, message, appeal_type, name=None, birthday=None):
+async def save_user_appeal(user_id, message, appeal_type, name=None, birthday=None, group_message_id=None):
     query = select(Users).where(
         Users.telegram_id == user_id
     )
@@ -71,13 +71,23 @@ async def save_user_appeal(user_id, message, appeal_type, name=None, birthday=No
             type=appeal_type,
             text=message,
             name=name,
-            birthday=birthday
+            birthday=birthday,
+            group_message_id=group_message_id
         )
 
         session.add(entry)
         await session.commit()
 
         return True
+
+
+async def get_request_text_by_group_message_id(group_message_id):
+    query = select(Requests.text).where(Requests.group_message_id == group_message_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        return result.scalar_one_or_none()
 
 
 async def get_user_thread_id(user_id):
