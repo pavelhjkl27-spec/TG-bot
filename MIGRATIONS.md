@@ -5,7 +5,12 @@
 - Конфиг: `alembic.ini`. Окружение: `migrations/env.py` использует движок и метаданные из
   `app/database.py`, то есть URL берётся из `DATABASE_URL` (`.env`, в Docker — `compose.yaml`).
   Отдельно URL нигде не задаётся.
-- Миграции: `migrations/versions/`. Первая, `22fe4fd8bb35_baseline`, описывает схему на момент перехода.
+- Миграции: `migrations/versions/`:
+  - `22fe4fd8bb35_baseline` — схема на момент перехода на Alembic;
+  - `3b877d403a8d_fsm_storage` — таблица `fsm_storage` (персистентное FSM, `app/fsm_storage.py`).
+- **Разметка старой базы — всегда на baseline (`alembic stamp 22fe4fd8bb35`), не на `head`.** `stamp head`
+  пометил бы как применённые и все более поздние миграции, хотя их таблиц (например, `fsm_storage`) в
+  базе нет — бот стартовал бы и падал на первом обращении к ним.
 - Бот при старте сам выполняет `alembic upgrade head` (`run_migrations()` в `app/database.py`,
   до 5 попыток, как раньше с `init_db`).
 - **Защита:** если в базе таблицы уже есть, а `alembic_version` нет (база создана до Alembic), бот
@@ -28,15 +33,16 @@
 python run.py            # сам выполнит upgrade head
 # или без бота:
 alembic upgrade head
-alembic current          # -> 22fe4fd8bb35 (head)
+alembic current          # -> 3b877d403a8d (head)
 ```
 
 **Старая dev-база, созданная через `create_all`**: бот откажется стартовать с `UnstampedDatabaseError`.
 Если в dev-базе нет ничего ценного, проще всего её пересоздать. Если данные нужны:
 
 ```bash
-alembic stamp head       # только записывает версию в alembic_version, таблицы не трогает
-alembic check            # должно быть: No new upgrade operations detected.
+alembic stamp 22fe4fd8bb35  # baseline: только записывает версию в alembic_version, таблицы не трогает
+alembic upgrade head        # накатывает миграции после baseline (fsm_storage, ...)
+alembic check               # должно быть: No new upgrade operations detected.
 ```
 
 Если `alembic check` нашёл расхождения, dev-схема отличается от моделей. Тогда `alembic stamp base`
@@ -70,12 +76,13 @@ ls -lh backups/ | tail -3
 
 ### 2.3. Сверить схему прода с baseline
 
-Создаём во временной базе эталонную схему через baseline и сравниваем со схемой прода.
+Создаём во временной базе эталонную схему **ровно до baseline** (не `head`: более поздних таблиц вроде
+`fsm_storage` на проде ещё нет) и сравниваем со схемой прода.
 
 ```bash
 docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE DATABASE schema_ref"'
 
-docker compose run --rm bot sh -c 'DATABASE_URL="postgresql+asyncpg://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/schema_ref" alembic upgrade head'
+docker compose run --rm bot sh -c 'DATABASE_URL="postgresql+asyncpg://$POSTGRES_USER:$POSTGRES_PASSWORD@db:5432/schema_ref" alembic upgrade 22fe4fd8bb35'
 
 docker compose exec -T db sh -c 'pg_dump --schema-only --no-owner -T alembic_version -U "$POSTGRES_USER" -d "$POSTGRES_DB"' | grep -vE '^(--|\\restrict|\\unrestrict)' > /tmp/schema_prod.sql
 docker compose exec -T db sh -c 'pg_dump --schema-only --no-owner -T alembic_version -U "$POSTGRES_USER" -d schema_ref' | grep -vE '^(--|\\restrict|\\unrestrict)' > /tmp/schema_ref.sql
@@ -106,13 +113,13 @@ docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
 ### 2.4. Разметить прод-базу
 
 ```bash
-docker compose run --rm bot alembic stamp head
-docker compose run --rm bot alembic current     # -> 22fe4fd8bb35 (head)
-docker compose run --rm bot alembic check       # -> No new upgrade operations detected.
+docker compose run --rm bot alembic stamp 22fe4fd8bb35
+docker compose run --rm bot alembic current     # -> 22fe4fd8bb35 (НЕ head — так и должно быть)
 ```
 
 `stamp` только создаёт таблицу `alembic_version` и записывает в неё номер ревизии. Данные и остальные
-таблицы он не трогает. Отменить разметку: `docker compose run --rm bot alembic stamp base`.
+таблицы он не трогает. Миграции после baseline (`fsm_storage`, ...) бот сам накатит при старте в 2.5.
+Именно поэтому здесь `stamp 22fe4fd8bb35`, а не `stamp head` — см. предупреждение в начале файла. Отменить разметку: `docker compose run --rm bot alembic stamp base`.
 
 ### 2.5. Запустить бота
 
@@ -122,9 +129,11 @@ docker compose logs --tail 30 bot
 ```
 
 В логах должно быть `Database migrations applied`, затем обычный старт polling. Проверьте, что данные
-на месте:
+на месте и что база теперь на head:
 
 ```bash
+docker compose run --rm bot alembic current     # -> 3b877d403a8d (head)
+docker compose run --rm bot alembic check       # -> No new upgrade operations detected.
 docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT (SELECT count(*) FROM users) AS users, (SELECT count(*) FROM requests) AS requests, (SELECT version_num FROM alembic_version) AS alembic;"'
 ```
 

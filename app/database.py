@@ -33,7 +33,7 @@ def _upgrade_to_head(connection):
     if 'users' in tables and 'alembic_version' not in tables:
         raise UnstampedDatabaseError(
             'База данных создана до перехода на Alembic (таблицы есть, alembic_version нет). '
-            'Сверьте схему и выполните `alembic stamp head` — см. MIGRATIONS.md.'
+            'Сверьте схему и разметьте её baseline-ревизией (`alembic stamp <baseline>`, не head) — см. MIGRATIONS.md.'
         )
 
     alembic_config = AlembicConfig(str(ALEMBIC_INI_PATH))

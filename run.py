@@ -7,12 +7,13 @@ from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from sentry_sdk.integrations.logging import ignore_logger
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.exceptions import TelegramRetryAfter
 
 from config import Config
 from app.handlers import router
 from app.database import run_migrations, UnstampedDatabaseError
+from app.fsm_storage import PostgresStorage
 
 
 logging.basicConfig(
@@ -88,7 +89,7 @@ async def retry_after_middleware(make_request, bot, method):
 events_isolation = SimpleEventIsolation()
 
 dp = Dispatcher(
-    storage=MemoryStorage(),
+    storage=PostgresStorage(),
     events_isolation=events_isolation
 )
 dp.include_router(router)
@@ -105,33 +106,29 @@ async def on_error(event):
     return True
 
 
-async def cleanup_idle_fsm_state(dispatcher: Dispatcher, isolation: SimpleEventIsolation) -> None:
+async def cleanup_idle_fsm_locks(isolation: SimpleEventIsolation) -> None:
     """
-    aiogram хранит блокировки диалогов (SimpleEventIsolation._locks) и записи
-    FSM (MemoryStorage.storage) в defaultdict, которые растут с каждым новым
-    диалогом и никогда сами не очищаются (в исходниках aiogram на этот счёт
-    прямо стоит комментарий авторов: "TODO: Unused locks cleaner is needed").
-    Это утечка памяти при долгой работе процесса без перезапуска.
+    aiogram хранит блокировки диалогов (SimpleEventIsolation._locks) в
+    defaultdict, который растёт с каждым новым диалогом и никогда сам не
+    очищается (в исходниках aiogram на этот счёт прямо стоит комментарий
+    авторов: "TODO: Unused locks cleaner is needed"). Это утечка памяти при
+    долгой работе процесса без перезапуска.
 
-    Чистим периодически только то, что безопасно чистить:
-      - locks, которые прямо сейчас никем не удерживаются (между проверкой
-        `not lock.locked()` и удалением ключа нет ни одного `await`, поэтому
-        в кооперативной модели asyncio интерливинг с новым обращением к
-        этому же ключу исключён);
-      - записи FSM без состояния и без данных — то есть полностью
-        простаивающие диалоги, где нечего терять. Диалоги с незавершённым
-        шагом формы (есть state и/или уже введённые данные) не трогаются.
+    Периодически удаляем locks, которые прямо сейчас никем не удерживаются
+    (между проверкой `not lock.locked()` и удалением ключа нет ни одного
+    `await`, поэтому в кооперативной модели asyncio интерливинг с новым
+    обращением к этому же ключу исключён).
 
-    Оба атрибута — приватные детали реализации aiogram, а не публичный API,
-    поэтому обращение к ним обёрнуто в защитные try/except: если структура
+    Сами записи FSM живут в Postgres (PostgresStorage) и чистки не требуют:
+    пустая запись удаляется хранилищем сразу при state.clear().
+
+    `_locks` — приватная деталь реализации aiogram, а не публичный API,
+    поэтому обращение к нему обёрнуто в защитный try/except: если структура
     изменится в новой версии aiogram, очистка просто перестанет работать (с
     предупреждением в логах), а не уронит бота.
     """
     while True:
         await asyncio.sleep(FSM_CLEANUP_INTERVAL_SECONDS)
-
-        removed_locks = remaining_locks = None
-        removed_records = remaining_records = None
 
         try:
             locks = isolation._locks
@@ -139,30 +136,13 @@ async def cleanup_idle_fsm_state(dispatcher: Dispatcher, isolation: SimpleEventI
 
             for key in stale_lock_keys:
                 del locks[key]
-
-            removed_locks = len(stale_lock_keys)
-            remaining_locks = len(locks)
         except AttributeError as error:
             logger.warning('Очистка FSM-блокировок пропущена (несовместимая версия aiogram?): %s', error)
-
-        try:
-            storage = dispatcher.storage.storage
-            idle_keys = [
-                key for key, record in storage.items()
-                if record.state is None and not record.data
-            ]
-
-            for key in idle_keys:
-                del storage[key]
-
-            removed_records = len(idle_keys)
-            remaining_records = len(storage)
-        except AttributeError as error:
-            logger.warning('Очистка простаивающих FSM-записей пропущена (несовместимая версия aiogram?): %s', error)
+            continue
 
         logger.info(
-            'Периодическая очистка FSM: удалено locks=%s (осталось %s), удалено idle-записей=%s (осталось %s)',
-            removed_locks, remaining_locks, removed_records, remaining_records
+            'Периодическая очистка FSM-блокировок: удалено %s (осталось %s)',
+            len(stale_lock_keys), len(locks)
         )
 
 
@@ -215,7 +195,7 @@ async def main():
 
     # Ссылка сохраняется на месте вызова: `dp.start_polling` ниже держит цикл
     # событий живым до остановки бота, так что задача не будет собрана GC раньше времени.
-    cleanup_task = asyncio.create_task(cleanup_idle_fsm_state(dp, events_isolation))
+    cleanup_task = asyncio.create_task(cleanup_idle_fsm_locks(events_isolation))
 
     if Config.HEARTBEAT_URL:
         heartbeat_task = asyncio.create_task(
