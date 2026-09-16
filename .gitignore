@@ -12,3 +12,6 @@ env/
 prompts/
 CLAUDE.md
 e2e/
+
+# DB backups (real client data)
+backups/
