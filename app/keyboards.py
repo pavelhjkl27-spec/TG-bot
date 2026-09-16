@@ -46,7 +46,7 @@ def get_admin_keyboard():
                 types.KeyboardButton(text='Как пользоваться ботом?')
             ],
             [
-                types.KeyboardButton(text='Изменить "О нас"'),
+                types.KeyboardButton(text='Изменить «О нас»'),
                 types.KeyboardButton(text='Изменить прайс')
             ],
         ], resize_keyboard=True

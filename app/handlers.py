@@ -212,7 +212,7 @@ async def _deliver_client_submission(
         await safe_answer(
             message,
             context=f'ошибка сохранения обращения в БД user_id={user.id}',
-            text='Произошла временная ошибка на сервере. Пожалуйста, отправьте обращение ещё раз.'
+            text='Не получилось сохранить обращение из-за временного сбоя. Пожалуйста, отправьте его ещё раз.'
         )
         return
 
@@ -220,7 +220,7 @@ async def _deliver_client_submission(
         await safe_answer(
             message,
             context=f'пользователь не найден при сохранении обращения user_id={user.id}',
-            text='Произошла ошибка на стороне сервера. Пожалуйста, напишите /start'
+            text='Не получилось сохранить обращение. Пожалуйста, напишите /start и попробуйте снова.'
         )
         return
 
@@ -236,10 +236,10 @@ async def _deliver_client_submission(
 
 WELCOME_MENU_TEXT = (
     "👋 <b>Добро пожаловать!</b>\n\n"
-    "💰 Наш текущий прайс:\n<b>{price}</b>\n\n"
-    "👇 <i>Выберите нужное действие в меню ниже:</i>"
+    "💰 Актуальные цены на разборы:\n<b>{price}</b>\n\n"
+    "👇 Выберите нужное действие в меню ниже:"
 )
-DEFAULT_PRICE_FALLBACK = 'Прайс уточняется у администратора.'
+DEFAULT_PRICE_FALLBACK = 'Актуальные цены уточняются — напишите нам, и мы подскажем.'
 
 
 async def send_welcome_menu(message: types.Message, log_context: str) -> None:
@@ -274,8 +274,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'приветствие администратора admin_id={user.id}',
-        text='Здравствуйте, Екатерина!.\n\n'
-             'Вам доступен уникальный функционал ниже:',
+        text='Здравствуйте!\n\n'
+             'Вам доступны следующие функции:',
         reply_markup=get_admin_keyboard()
     )
 
@@ -287,7 +287,7 @@ async def cmd_help(message: types.Message):
         context=f'справка user_id={message.from_user.id}',
         text=(
             "ℹ️ <b>Справочная информация</b>\n\n"
-            "Я бот для приема заявок и обращений. Воспользуйтесь клавиатурой внизу, чтобы начать работу.")
+            "Здесь вы можете оставить заявку на разбор, задать вопрос или узнать о наших услугах. Воспользуйтесь кнопками внизу экрана.")
     )
 
 
@@ -302,7 +302,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'/bind из личного чата user_id={user.id}',
-            text='Вы не можете выполнить это действие здесь!'
+            text='Эту команду нужно выполнить в рабочей группе, а не в личном чате.'
         )
 
         return
@@ -324,7 +324,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'запрос прав администратора chat_id={message.chat.id}',
-            text='Сделайте бота администратором!'
+            text='Пожалуйста, сделайте бота администратором группы и повторите /bind.'
         )
 
         return
@@ -333,7 +333,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'запрос прав на управление темами chat_id={message.chat.id}',
-            text='Разрешите боту управлять темами!'
+            text='Пожалуйста, разрешите боту управлять темами (в правах администратора группы) и повторите /bind.'
         )
 
         return
@@ -342,8 +342,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'запрет /bind для user_id={user.id}',
-            text='Вы не являетесь админом этого бота, '
-                 'поэтому его функционал вам не доступен!'
+            text='Эта команда доступна только администратору бота.'
         )
 
         return
@@ -352,7 +351,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'запрос на форум/супергруппу chat_id={message.chat.id}',
-            text='Добавьте бота в форум/супергруппу!'
+            text='Пожалуйста, включите темы (Topics) в настройках группы и повторите /bind.'
         )
 
         return
@@ -363,7 +362,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'конфликт привязки группы chat_id={message.chat.id}',
-            text='Бот уже привязан к другой группе!'
+            text='Бот уже привязан к другой группе. Переносить привязку на новую группу через /bind сейчас не поддерживается.'
         )
 
         return
@@ -371,7 +370,7 @@ async def cmd_bind(message: types.Message, bot: Bot):
     await safe_answer(
         message,
         context=f'успешная привязка группы chat_id={message.chat.id}',
-        text='Бот был успешно привязан к группе!'
+        text='Бот успешно привязан к группе!'
     )
 
 
@@ -403,7 +402,7 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
         await safe_send_message(
             bot, event.chat.id,
             context=f'запрос на включение тем chat_id={event.chat.id}',
-            text='Включите темы в группе!'
+            text='Чтобы бот мог работать в этой группе, нужно включить темы (Topics) в её настройках. Бот сейчас выйдет из группы — включите темы и добавьте его снова.'
         )
         await bot.leave_chat(chat_id=event.chat.id)
 
@@ -415,7 +414,7 @@ async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
         await safe_send_message(
             bot, event.chat.id,
             context=f'конфликт привязки группы chat_id={event.chat.id}',
-            text='Бот уже привязан к другой группе!'
+            text='Бот уже привязан к другой группе, поэтому он сейчас покинет эту.'
         )
         await bot.leave_chat(chat_id=event.chat.id)
 
@@ -473,7 +472,7 @@ async def about_us(message: types.Message):
         await safe_answer(
             message,
             context=f'отсутствие описания "О нас" user_id={user.id}',
-            text='Описание уточняется у администратора или ошибка на сервере.'
+            text='Информация о нас пока не заполнена. Пожалуйста, задайте вопрос — мы ответим лично.'
         )
 
         return
@@ -481,7 +480,7 @@ async def about_us(message: types.Message):
     await safe_answer(
         message,
         context=f'текст "О нас" user_id={user.id}',
-        text=html.escape(about_us_text)
+        text=f'ℹ️ <b>О нас</b>\n\n{html.escape(about_us_text)}'
     )
 
 
@@ -495,7 +494,7 @@ async def question_text(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'запрос вопроса user_id={message.from_user.id}',
-        text='Задайте ваш вопрос:',
+        text='❓ <b>Ваш вопрос</b>\n\nНапишите, что вас интересует:',
         reply_markup=get_cancel_keyboard()
     )
 
@@ -515,7 +514,7 @@ async def newsletter(message: types.Message, state: FSMContext):
     )
 
 
-@router.message(F.text == 'Изменить "О нас"',
+@router.message(F.text == 'Изменить «О нас»',
                 F.chat.type == 'private',
                 F.from_user.id == Config.ADMIN_ID,
                 StateFilter(None))
@@ -525,7 +524,7 @@ async def change_about_us(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'запрос нового описания admin_id={message.from_user.id}',
-        text='Напишите описание вашего сервиса и предоставляемых вами услуг:'
+        text='Напишите новый текст раздела «О нас» — описание вашего сервиса и услуг:'
     )
 
 
@@ -568,7 +567,7 @@ async def admin_instruction(message: types.Message):
 
         '<b>3. Прайс и раздел «О нас»</b>\n'
         '• Кнопка «Изменить прайс» меняет прайс, который видят пользователи.\n'
-        '• Кнопка «Изменить "О нас"» меняет описание сервиса.\n'
+        '• Кнопка Изменить «О нас» меняет описание сервиса.\n'
         '• Эти настройки хранятся в базе данных и не удаляются при обычном '
         'перезапуске самого бота.\n\n'
 
@@ -627,7 +626,7 @@ async def menu(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'меню администратора admin_id={user.id}',
-        text='Вы в меню.',
+        text='Главное меню администратора.',
         reply_markup=get_admin_keyboard()
     )
 
@@ -649,7 +648,7 @@ async def back(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             context=f'Назад к дате рождения user_id={message.from_user.id}',
-            text='Введите вашу дату рождения в формате DD/MM/YYYY:'
+            text='📅 Введите вашу <b>дату рождения</b> в формате <code>ДД/ММ/ГГГГ</code> (например, <i>05/12/1984</i>):'
         )
 
     elif current_state == Form.birthday.state:
@@ -675,7 +674,7 @@ async def reply_to_message(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'отсутствие привязки группы admin_id={message.from_user.id}',
-            text='Бот не привязан к группе!'
+            text='Бот пока не привязан ни к одной группе. Выполните /bind.'
         )
 
         return
@@ -684,7 +683,7 @@ async def reply_to_message(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'несовпадение группы admin_id={message.from_user.id}',
-            text='Бот привязан к другой группе!'
+            text='Этот чат — не та группа, к которой привязан бот, поэтому ответ не будет доставлен клиенту.'
         )
 
         return
@@ -717,7 +716,7 @@ async def reply_to_message(message: types.Message, bot: Bot):
         await safe_answer(
             message,
             context=f'незарегистрированный пользователь thread_id={message.message_thread_id}',
-            text='Данный пользователь не зарегистрирован в боте!'
+            text='Клиент, привязанный к этой теме, не найден в базе бота — ответ не может быть доставлен.'
         )
 
         return
@@ -763,8 +762,8 @@ async def reply_to_message(message: types.Message, bot: Bot):
         await safe_send_message(
             bot, user_id,
             context=f'уведомление клиента о частичной недоставке user_id={user_id}',
-            text='⚠️ К сожалению, часть ответа администратора не удалось доставить. '
-                 'Пожалуйста, обратитесь ещё раз, если вопрос остался открытым.'
+            text='⚠️ К сожалению, основное содержимое ответа администратора не удалось доставить. '
+                 'Пожалуйста, напишите нам ещё раз, если вопрос остался открытым.'
         )
 
 
@@ -814,9 +813,8 @@ async def set_text(message: types.Message, state: FSMContext):
             message,
             context=f'нераспознанная дата рождения user_id={message.from_user.id}',
             text=(
-                "⚠️ <b>Ошибка формата</b>\n\n"
-                "Пожалуйста, введите дату строго в формате <code>ДД/ММ/ГГГГ</code>\n"
-                "<i>Пример: 05/12/1984</i>")
+                "⚠️ <b>Неверный формат даты</b>\n\n"
+                "Пожалуйста, введите дату в формате <code>ДД/ММ/ГГГГ</code>, например: <i>05/12/1984</i>")
         )
         return
 
@@ -843,7 +841,7 @@ async def set_text(message: types.Message, state: FSMContext):
         context=f'запрос текста обращения user_id={message.from_user.id}',
         text=(
             "✍️ <b>Текст обращения</b>\n\n"
-            "Напишите суть вашей заявки или задайте вопрос в свободной форме:"),
+            "Опишите, пожалуйста, суть вашей заявки — какой разбор вас интересует и что важно учесть:"),
         reply_markup=get_back_cancel_keyboard()
     )
 
@@ -856,7 +854,7 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         await safe_answer(
             message,
             context=f'нераспознанный текст заявки user_id={message.from_user.id}',
-            text="⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше обращение:</i>"
+            text="⚠️ <i>Пожалуйста, отправьте текст обращения сообщением (не фото и не файлом):</i>"
         )
         return
 
@@ -878,9 +876,8 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
             message,
             context=f'превышен лимит длины заявки user_id={message.from_user.id}',
             text=(
-                f"⚠️ Текст обращения слишком длинный — сообщение получится на "
-                f"{overflow} символ(ов) больше допустимого лимита Telegram. "
-                f"Пожалуйста, сократите текст обращения и отправьте его заново."
+                f"⚠️ Текст обращения слишком длинный (примерно на {overflow} символов). "
+                f"Пожалуйста, сократите его и отправьте ещё раз."
             )
         )
         return
@@ -905,9 +902,9 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         user=user, group_id=group_id, final_text=final_text,
         appeal_type='Bid', save_text=message.text,
         name=data['name'], birthday=data['birthday'],
-        telegram_error_text='Ошибка на стороне сервера. Попробуйте создать заявку позже.',
-        db_error_text='Временная ошибка на сервере. Попробуйте отправить заявку ещё раз через некоторое время.',
-        not_registered_text='Вы не зарегистрированы в боте. Напишите /start',
+        telegram_error_text='К сожалению, сейчас не получилось отправить заявку. Пожалуйста, попробуйте ещё раз чуть позже.',
+        db_error_text='Не получилось обработать вашу заявку. Пожалуйста, отправьте её ещё раз через несколько минут.',
+        not_registered_text='Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.',
         undelivered_text='Ваша заявка не была доставлена. Попробуйте отправить её ещё раз чуть позже.',
         success_text=(
             "✅ <b>Ваша заявка успешно отправлена!</b>\n\n"
@@ -925,7 +922,7 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         await safe_answer(
             message,
             context=f'нераспознанный текст вопроса user_id={message.from_user.id}',
-            text='Текст не распознан. Пожалуйста, напишите вопрос текстом!'
+            text='Пожалуйста, отправьте вопрос текстовым сообщением.'
         )
         return
 
@@ -941,9 +938,8 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
             message,
             context=f'превышен лимит длины вопроса user_id={message.from_user.id}',
             text=(
-                f"⚠️ Текст вопроса слишком длинный — сообщение получится на "
-                f"{overflow} символ(ов) больше допустимого лимита Telegram. "
-                f"Пожалуйста, сократите вопрос и отправьте его заново."
+                f"⚠️ Текст вопроса слишком длинный (примерно на {overflow} символов). "
+                f"Пожалуйста, сократите его и отправьте ещё раз."
             )
         )
         return
@@ -959,7 +955,7 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         await safe_answer(
             message,
             context=f'группа не привязана (вопрос) user_id={user.id}',
-            text='Ошибка на сервере. Попробуйте позже.'
+            text='Бот временно не работает, попробуйте позже.'
         )
         return
 
@@ -967,9 +963,9 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         message, state, bot,
         user=user, group_id=group_id, final_text=final_text,
         appeal_type='Question', save_text=message.text,
-        telegram_error_text='Ошибка на стороне сервера. Попробуйте задать вопрос позже.',
-        db_error_text='Временная ошибка на сервере. Попробуйте задать вопрос ещё раз через некоторое время.',
-        not_registered_text='Вы не зарегистрированы в боте. Пожалуйста, напишите /start',
+        telegram_error_text='К сожалению, сейчас не получилось отправить вопрос. Пожалуйста, попробуйте ещё раз чуть позже.',
+        db_error_text='Не получилось обработать ваш вопрос. Пожалуйста, отправьте его ещё раз через несколько минут.',
+        not_registered_text='Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.',
         undelivered_text='Ваш вопрос не был доставлен. Попробуйте отправить его ещё раз чуть позже.',
         success_text=(
             "✅ <b>Ваш вопрос успешно отправлен!</b>\n\n"
@@ -987,7 +983,7 @@ async def send_newsletter(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             context=f'нераспознанный текст рассылки admin_id={message.from_user.id}',
-            text='Текст не распознан. Пожалуйста, напишите текст снова.'
+            text='Пожалуйста, отправьте текст рассылки текстовым сообщением.'
         )
 
         return
@@ -999,8 +995,7 @@ async def send_newsletter(message: types.Message, state: FSMContext):
             message,
             context=f'превышен лимит длины рассылки admin_id={message.from_user.id}',
             text=(
-                f"⚠️ Текст рассылки слишком длинный — сообщение получится на "
-                f"{overflow} символ(ов) больше допустимого лимита Telegram. "
+                f"⚠️ Текст рассылки слишком длинный (примерно на {overflow} символов сверх лимита Telegram). "
                 f"Пожалуйста, сократите текст."
             )
         )
@@ -1013,8 +1008,8 @@ async def send_newsletter(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'запрос подтверждения рассылки admin_id={message.from_user.id}',
-        text=f'Вы уверены?\n\n'
-             f'Вот так выглядит ваше сообщение сейчас:\n',
+        text=f'Подтвердите отправку рассылки.\n\n'
+             f'Сообщение будет отправлено всем активным клиентам бота. Вот как оно выглядит:\n',
         reply_markup=get_sure_keyboard()
     )
     await safe_answer(
@@ -1032,7 +1027,7 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
         await safe_answer(
             message,
             context=f'некорректный вариант подтверждения рассылки admin_id={message.from_user.id}',
-            text='Такого варианта нету!'
+            text='Пожалуйста, воспользуйтесь кнопками «Подтвердить» или «Изменить».'
         )
 
         return
@@ -1047,7 +1042,7 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
             await safe_answer(
                 message,
                 context=f'отсутствие пользователей для рассылки admin_id={message.from_user.id}',
-                text='У бота нету пользователей. Пока что сделать рассылку нельзя.',
+                text='У бота пока нет ни одного пользователя, поэтому рассылку отправить некому.',
                 reply_markup=get_admin_keyboard()
             )
 
@@ -1083,9 +1078,9 @@ async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot)
             context=f'итоги рассылки admin_id={message.from_user.id}',
             text=f'Рассылка завершена\n\n'
                  f'Отправлено: {sent}\n'
-                 f'Не отправлено: {not_sent}\n\n'
-                 f'Всего человек: {len(users)}\n'
-                 f'Активных из них: {sent + not_sent}',
+                 f'Не доставлено (не отправлено): {not_sent}\n\n'
+                 f'Всего пользователей в базе: {len(users)}\n'
+                 f'Из них активных: {sent + not_sent}',
             reply_markup=get_admin_keyboard()
         )
 
@@ -1112,7 +1107,7 @@ async def set_about_us(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             context=f'нераспознанный текст "О нас" admin_id={message.from_user.id}',
-            text='⚠️ <i>Текст не распознан. Пожалуйста, напишите ваше описание:</i>'
+            text='⚠️ <i>Пожалуйста, отправьте описание текстовым сообщением:</i>'
         )
 
         return
@@ -1128,7 +1123,7 @@ async def set_about_us(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             context=f'ошибка сохранения "О нас" admin_id={message.from_user.id}',
-            text='Текст не был сохранен! Пожалуйста, попробуйте снова.'
+            text='Текст не удалось сохранить. Пожалуйста, попробуйте ещё раз.'
         )
 
         return
@@ -1136,7 +1131,7 @@ async def set_about_us(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'успешное изменение "О нас" admin_id={message.from_user.id}',
-        text='Текст был успешно изменен!',
+        text='Текст успешно изменён!',
         reply_markup=get_admin_keyboard()
     )
 
@@ -1149,7 +1144,7 @@ async def set_price_text(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             context=f'нераспознанный текст прайса admin_id={message.from_user.id}',
-            text='⚠️ <i>Текст не распознан. Пожалуйста, напишите ваш прайс:</i>'
+            text='⚠️ <i>Пожалуйста, отправьте прайс текстовым сообщением:</i>'
         )
 
         return
@@ -1165,7 +1160,7 @@ async def set_price_text(message: types.Message, state: FSMContext):
         await safe_answer(
             message,
             context=f'ошибка сохранения прайса admin_id={message.from_user.id}',
-            text='Прайс не был сохранен! Пожалуйста, попробуйте снова.'
+            text='Прайс не удалось сохранить. Пожалуйста, попробуйте ещё раз.'
         )
 
         return
@@ -1173,6 +1168,6 @@ async def set_price_text(message: types.Message, state: FSMContext):
     await safe_answer(
         message,
         context=f'успешное изменение прайса admin_id={message.from_user.id}',
-        text='Прайс был успешно изменен!',
+        text='Прайс успешно изменён!',
         reply_markup=get_admin_keyboard()
     )
