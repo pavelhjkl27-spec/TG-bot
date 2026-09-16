@@ -90,6 +90,32 @@ async def get_request_text_by_group_message_id(group_message_id):
         return result.scalar_one_or_none()
 
 
+async def get_bid_history_by_thread_id(thread_id):
+    """
+    Клиент резолвится тем же способом, что и в get_user_id (Users.topic_id == thread_id),
+    без изобретения нового способа связи темы форума с клиентом. Возвращает None, если
+    тема ни к одному клиенту не привязана, иначе список (created_at, text) записей
+    Requests.type == 'Bid' этого клиента в хронологическом порядке (может быть пустым).
+    """
+    query = select(Users.id).where(Users.topic_id == thread_id)
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+        user_pk = result.scalar_one_or_none()
+
+        if user_pk is None:
+            return None
+
+        requests_query = (
+            select(Requests.created_at, Requests.text)
+            .where(Requests.user_id == user_pk, Requests.type == 'Bid')
+            .order_by(Requests.created_at)
+        )
+        result = await session.execute(requests_query)
+
+        return result.all()
+
+
 async def get_user_thread_id(user_id):
     query = select(Users).where(Users.telegram_id == user_id)
 

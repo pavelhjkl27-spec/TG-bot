@@ -30,7 +30,8 @@ from app.db_requests import (add_user,
                              get_about_us, get_users,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
-                             set_price, get_request_text_by_group_message_id)
+                             set_price, get_request_text_by_group_message_id,
+                             get_bid_history_by_thread_id)
 from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, safe_answer, safe_send_message,
                        safe_edit_message_text, safe_answer_callback)
 
@@ -48,6 +49,7 @@ SAVE_APPEAL_RETRY_DELAY_SECONDS = 0.5
 
 CLIENT_QUOTE_MAX_LENGTH = 150
 LEGACY_QUOTE_MAX_LENGTH = 2500
+HISTORY_PREVIEW_MAX_LENGTH = 150
 
 # Типы контента, для которых Bot API вообще поддерживает caption у copyMessage —
 # для остальных (стикеры, video_note и т.п.) caption физически некуда передать.
@@ -878,6 +880,91 @@ async def cmd_bind(message: types.Message, bot: Bot):
     )
 
 
+def _history_message_texts(history: list) -> list[str]:
+    """
+    Собирает историю заказов в одно или несколько сообщений (не более
+    TELEGRAM_MESSAGE_LIMIT символов каждое), не разрывая ни одну запись
+    посередине. Записей мало, а превью коротко (HISTORY_PREVIEW_MAX_LENGTH),
+    поэтому одна запись сама по себе никогда не превышает лимит.
+    """
+    header = '🗂 <b>История заказов клиента</b>'
+    entries = []
+
+    for created_at, text_value in history:
+        preview = text_value if len(text_value) <= HISTORY_PREVIEW_MAX_LENGTH \
+            else text_value[:HISTORY_PREVIEW_MAX_LENGTH] + '…'
+        entries.append(f'📅 {created_at.strftime("%d.%m.%Y %H:%M")}\n{html.escape(preview)}')
+
+    messages = []
+    current = header
+
+    for entry in entries:
+        candidate = f'{current}\n\n{entry}'
+
+        if exceeds_telegram_limit(candidate):
+            messages.append(current)
+            current = entry
+        else:
+            current = candidate
+
+    messages.append(current)
+
+    return messages
+
+
+@router.message(Command('history'), F.chat.type.in_({'group', 'supergroup'}))
+async def client_history(message: types.Message):
+    """
+    /history — только для админа, только внутри темы конкретного клиента
+    (Users.topic_id == message.message_thread_id, тот же способ резолва, что и
+    в reply_to_message). Не-админ получает полную тишину — без утечки самого
+    факта существования этой команды или данных клиента (проверено e2e).
+    Админ вне темы клиента (общая тема группы либо тема без привязанного
+    клиента) получает короткое пояснение — это не утечка данных (клиент ещё
+    не определён) и избавляет админа от гадания, почему команда промолчала.
+    """
+    if message.from_user is None or message.from_user.id != Config.ADMIN_ID:
+        return
+
+    group_id = await get_group_id()
+
+    if group_id is None or message.chat.id != group_id or message.message_thread_id is None:
+        await safe_answer(
+            message,
+            context=f'/history вне темы клиента admin_id={message.from_user.id}',
+            text='Эта команда работает только внутри темы конкретного клиента в рабочей группе.'
+        )
+
+        return
+
+    history = await get_bid_history_by_thread_id(message.message_thread_id)
+
+    if history is None:
+        await safe_answer(
+            message,
+            context=f'/history в непривязанной теме thread_id={message.message_thread_id}',
+            text='Клиент, привязанный к этой теме, не найден в базе бота.'
+        )
+
+        return
+
+    if not history:
+        await safe_answer(
+            message,
+            context=f'/history без заказов thread_id={message.message_thread_id}',
+            text='У этого клиента пока нет ни одной заявки.'
+        )
+
+        return
+
+    for chunk in _history_message_texts(history):
+        await safe_answer(
+            message,
+            context=f'/history сообщение thread_id={message.message_thread_id}',
+            text=chunk
+        )
+
+
 @router.my_chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
 async def bot_added_to_chat(event: types.ChatMemberUpdated, bot: Bot):
     user = event.from_user
@@ -1068,7 +1155,9 @@ async def admin_instruction(message: types.Message):
         '• Чтобы ответить клиенту, откройте его тему и используйте '
         '<b>«Ответить / Reply»</b> именно на сообщение бота с заявкой или вопросом.\n'
         '• Обычное сообщение в теме клиенту автоматически не отправляется '
-        '(кроме активного диалога — см. ниже).\n\n'
+        '(кроме активного диалога — см. ниже).\n'
+        '• Команда /history прямо в теме клиента покажет список всех его заявок '
+        '(без вопросов) с датами.\n\n'
 
         '<b>Диалог с клиентом</b>\n'
         '• Клиент может нажать «Запросить диалог с админом» — в его теме появится запрос '
