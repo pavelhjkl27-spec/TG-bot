@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramRetryAfter
 
 from config import Config
 from app.handlers import router
-from app.database import init_db
+from app.database import run_migrations, UnstampedDatabaseError
 
 
 logging.basicConfig(
@@ -196,8 +196,11 @@ async def main():
 
     for attempt in range(db_init_attempts):
         try:
-            await init_db()
+            await run_migrations()
             break
+        except UnstampedDatabaseError:
+            # Повтор не поможет — нужна ручная разметка базы (MIGRATIONS.md).
+            raise
         except Exception as error:
             if attempt == db_init_attempts - 1:
                 raise
@@ -208,7 +211,7 @@ async def main():
             )
             await asyncio.sleep(2)
 
-    logger.info('Database initialized')
+    logger.info('Database migrations applied')
 
     # Ссылка сохраняется на месте вызова: `dp.start_polling` ниже держит цикл
     # событий живым до остановки бота, так что задача не будет собрана GC раньше времени.
