@@ -1,6 +1,10 @@
 import asyncio
 import logging
 
+import aiohttp
+import sentry_sdk
+from sentry_sdk.integrations.asyncio import AsyncioIntegration
+from sentry_sdk.integrations.logging import ignore_logger
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
@@ -18,7 +22,28 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Встроенная в sentry-sdk LoggingIntegration (включена по умолчанию) превращает
+# каждую запись уровня ERROR и выше — в том числе `logger.exception` в `on_error`
+# ниже — в событие Sentry с трейсбеком, а записи INFO+ прикладывает как breadcrumbs.
+# Поэтому отдельный `capture_exception` не нужен: вывод в stdout остаётся прежним,
+# дублей в Sentry нет. AsyncioIntegration дополнительно ловит исключения, которыми
+# упали фоновые задачи (очистка FSM, heartbeat).
+if Config.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=Config.SENTRY_DSN,
+        integrations=[AsyncioIntegration()],
+        send_default_pii=False,
+    )
+    # aiogram пишет ERROR "Failed to fetch updates" на каждую неудачную попытку
+    # long-polling и сам переподключается с backoff — сетевой сбой дал бы серию
+    # ложных алертов. В stdout эти записи остаются.
+    ignore_logger('aiogram.dispatcher')
+    logger.info('Sentry initialized')
+else:
+    logger.info('SENTRY_DSN не задан — Sentry отключён')
+
 FSM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+HEARTBEAT_TIMEOUT_SECONDS = 10
 
 
 bot = Bot(
@@ -71,10 +96,11 @@ dp.include_router(router)
 
 @dp.errors()
 async def on_error(event):
-    logger.exception(
+    logger.error(
         'Необработанное исключение при обработке апдейта %s: %s',
         event.update.update_id,
-        event.exception
+        event.exception,
+        exc_info=event.exception
     )
     return True
 
@@ -140,6 +166,29 @@ async def cleanup_idle_fsm_state(dispatcher: Dispatcher, isolation: SimpleEventI
         )
 
 
+async def send_heartbeat(url: str, interval_minutes: int) -> None:
+    """
+    Push-heartbeat во внешний dead-man's-switch (healthchecks.io / cronitor):
+    если пинги перестают приходить (процесс упал, завис цикл событий, контейнер
+    не поднялся), сервис сам алертит админа. Первый пинг — сразу при старте.
+
+    Любая ошибка пинга только логируется warning'ом: недоступность сервиса
+    мониторинга не должна влиять на работу бота.
+    """
+    timeout = aiohttp.ClientTimeout(total=HEARTBEAT_TIMEOUT_SECONDS)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                async with session.get(url) as response:
+                    if response.status >= 400:
+                        logger.warning('Heartbeat: сервис ответил HTTP %s', response.status)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                logger.warning('Heartbeat не отправлен: %r', error)
+
+            await asyncio.sleep(interval_minutes * 60)
+
+
 async def main():
     logger.info('Bot is starting...')
 
@@ -164,6 +213,14 @@ async def main():
     # Ссылка сохраняется на месте вызова: `dp.start_polling` ниже держит цикл
     # событий живым до остановки бота, так что задача не будет собрана GC раньше времени.
     cleanup_task = asyncio.create_task(cleanup_idle_fsm_state(dp, events_isolation))
+
+    if Config.HEARTBEAT_URL:
+        heartbeat_task = asyncio.create_task(
+            send_heartbeat(Config.HEARTBEAT_URL, Config.HEARTBEAT_INTERVAL_MINUTES)
+        )
+        logger.info('Heartbeat enabled: every %s min', Config.HEARTBEAT_INTERVAL_MINUTES)
+    else:
+        logger.info('HEARTBEAT_URL не задан — heartbeat отключён')
 
     await dp.start_polling(bot)
 
