@@ -1,6 +1,6 @@
 from aiogram import types
 
-from app.callbacks import DialogCallback
+from app.callbacks import DialogCallback, NewsletterCallback
 
 
 def get_main_keyboard():
@@ -110,11 +110,22 @@ def get_admin_keyboard():
     return keyboard
 
 
-def get_sure_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text='Подтвердить'), types.KeyboardButton(text='Изменить')]
-        ], resize_keyboard=True, one_time_keyboard=True
-    )
+def get_newsletter_confirm_markup(draft_id: str):
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(
+                text='Подтвердить',
+                callback_data=NewsletterCallback(action='confirm', draft_id=draft_id).pack()
+            ),
+            types.InlineKeyboardButton(
+                text='Изменить',
+                callback_data=NewsletterCallback(action='edit', draft_id=draft_id).pack()
+            ),
+            types.InlineKeyboardButton(
+                text='Отменить',
+                callback_data=NewsletterCallback(action='cancel', draft_id=draft_id).pack()
+            ),
+        ]
+    ])
 
     return keyboard

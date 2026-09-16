@@ -15,3 +15,16 @@ class DialogCallback(CallbackData, prefix='dialog'):
     action: str
     client_id: int
     dialog_id: str
+
+
+class NewsletterCallback(CallbackData, prefix='newsletter'):
+    """
+    Inline-кнопки под превью рассылки: `newsletter:<action>:<draft_id>`.
+
+    action — 'confirm' | 'edit' | 'cancel'. draft_id совпадает с data['draft_id'] в FSM
+    админа (Newsletter.sure): любое решение атомарно стирает draft_id, поэтому повторное,
+    позднее или гоночное нажатие (в том числе другой кнопки того же превью) и кнопки старых
+    превью не проходят проверку перехода и ничего не делают.
+    """
+    action: str
+    draft_id: str

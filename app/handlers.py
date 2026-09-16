@@ -12,11 +12,11 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.callbacks import DialogCallback
+from app.callbacks import DialogCallback, NewsletterCallback
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
-                           get_admin_keyboard, get_sure_keyboard,
+                           get_admin_keyboard, get_newsletter_confirm_markup,
                            get_dialog_waiting_keyboard, get_dialog_active_keyboard,
                            get_dialog_request_markup, get_dialog_status_markup)
 from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice, Dialog
@@ -31,7 +31,7 @@ from app.db_requests import (add_user,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
                              set_price, get_request_text_by_group_message_id)
-from app.utils import (exceeds_telegram_limit, safe_answer, safe_send_message,
+from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, safe_answer, safe_send_message,
                        safe_edit_message_text, safe_answer_callback)
 
 logger = logging.getLogger(__name__)
@@ -1610,101 +1610,217 @@ async def send_newsletter(message: types.Message, state: FSMContext):
 
         return
 
-    await state.update_data(newsletter=message.text)
+    draft_id = secrets.token_hex(4)
+
+    await state.update_data(newsletter=message.text, draft_id=draft_id)
     await state.set_state(Newsletter.sure)
 
     await safe_answer(
         message,
-        context=f'запрос подтверждения рассылки admin_id={message.from_user.id}',
-        text=f'Подтвердите отправку рассылки.\n\n'
-             f'Сообщение будет отправлено всем активным клиентам бота. Вот как оно выглядит:\n',
-        reply_markup=get_sure_keyboard()
-    )
-    await safe_answer(
-        message,
-        context=f'предпросмотр рассылки admin_id={message.from_user.id}',
-        text=f'{html.escape(message.text)}'
+        context=f'предпросмотр и запрос подтверждения рассылки admin_id={message.from_user.id}',
+        text=_newsletter_preview_text(message.text),
+        reply_markup=get_newsletter_confirm_markup(draft_id)
     )
 
 
 @router.message(Newsletter.sure,
                 F.chat.type == 'private',
                 F.from_user.id == Config.ADMIN_ID)
-async def accept_newsletter(message: types.Message, state: FSMContext, bot: Bot):
-    if not message or not message.text or message.text not in ['Подтвердить', 'Изменить']:
-        await safe_answer(
-            message,
-            context=f'некорректный вариант подтверждения рассылки admin_id={message.from_user.id}',
-            text='Пожалуйста, воспользуйтесь кнопками «Подтвердить» или «Изменить».'
+async def accept_newsletter(message: types.Message):
+    await safe_answer(
+        message,
+        context=f'некорректный вариант подтверждения рассылки admin_id={message.from_user.id}',
+        text='Пожалуйста, воспользуйтесь кнопками «Подтвердить», «Изменить» или «Отменить».'
+    )
+
+
+# ------------------------------------------------------------ Подтверждение рассылки
+#
+# Превью и запрос подтверждения — одно сообщение с inline-кнопками NewsletterCallback.
+# Решение по кнопке принимается только через атомарный PostgresStorage.transition_state
+# (Newsletter.sure + текущий draft_id → новое состояние, data стирается): из любых
+# повторных/гоночных нажатий — одной и той же или разных кнопок — эффект даёт ровно одно,
+# остальные получают answer и снимают устаревшие кнопки. Переход делается ДО рассылки:
+# крах посреди отправки не приведёт к повторной рассылке (at-most-once).
+
+NEWSLETTER_PREVIEW_HEADER = (
+    'Подтвердите отправку рассылки.\n\n'
+    'Сообщение будет отправлено всем активным клиентам бота. Вот как оно выглядит:\n\n'
+)
+NEWSLETTER_PREVIEW_TRUNCATED = '\n\n<i>✂️ Предпросмотр обрезан — клиентам уйдёт полный текст.</i>'
+NEWSLETTER_STALE_TEXT = 'Эта рассылка уже отправлена, изменена или отменена.'
+
+
+def _newsletter_preview_text(newsletter: str, footer: str = '') -> str:
+    """
+    Превью рассылки для админа. Сам текст рассылки ограничен лимитом Telegram ещё на вводе,
+    но вместе с заголовком и footer превью может его превысить — тогда обрезается только
+    показ (по исходным символам, чтобы не разорвать HTML-сущность вроде &amp;), а клиентам
+    уходит полный текст из FSM.
+    """
+    footer_part = f'\n\n{footer}' if footer else ''
+    escaped = html.escape(newsletter)
+
+    if len(NEWSLETTER_PREVIEW_HEADER) + len(escaped) + len(footer_part) <= TELEGRAM_MESSAGE_LIMIT:
+        return f'{NEWSLETTER_PREVIEW_HEADER}{escaped}{footer_part}'
+
+    budget = (TELEGRAM_MESSAGE_LIMIT - len(NEWSLETTER_PREVIEW_HEADER)
+              - len(NEWSLETTER_PREVIEW_TRUNCATED) - len(footer_part))
+    pieces = []
+    used = 0
+
+    for char in newsletter:
+        escaped_char = html.escape(char)
+
+        if used + len(escaped_char) > budget:
+            break
+
+        pieces.append(escaped_char)
+        used += len(escaped_char)
+
+    return f'{NEWSLETTER_PREVIEW_HEADER}{"".join(pieces)}{NEWSLETTER_PREVIEW_TRUNCATED}{footer_part}'
+
+
+async def _decide_newsletter(callback: types.CallbackQuery, callback_data: NewsletterCallback,
+                             state: FSMContext, bot: Bot, *, to_state, footer: str) -> dict | None:
+    """
+    Newsletter.sure (с этим draft_id) → to_state. Победитель получает прежнюю data, а превью
+    теряет кнопки и получает footer с решением. Проигравший (повтор, гонка, старое превью) —
+    None, кнопки снимаются, на callback отвечено.
+    """
+    old_data = await state.storage.transition_state(
+        state.key, from_state=Newsletter.sure, match={'draft_id': callback_data.draft_id},
+        to_state=to_state, to_data={}
+    )
+
+    if old_data is None:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'неактуальное превью рассылки admin_id={callback.from_user.id}',
+                                   text=NEWSLETTER_STALE_TEXT)
+        return None
+
+    if callback.message is not None:
+        await safe_edit_message_text(
+            bot, callback.message.chat.id, callback.message.message_id,
+            context=f'итог превью рассылки admin_id={callback.from_user.id}',
+            text=_newsletter_preview_text(old_data['newsletter'], footer)
         )
 
+    return old_data
+
+
+@router.callback_query(NewsletterCallback.filter(), F.from_user.id != Config.ADMIN_ID)
+async def newsletter_callback_not_admin(callback: types.CallbackQuery):
+    await safe_answer_callback(
+        callback,
+        context=f'кнопка рассылки не от админа user_id={callback.from_user.id}',
+        text='Эта кнопка доступна только администратору.', show_alert=True
+    )
+
+
+@router.callback_query(NewsletterCallback.filter(F.action == 'confirm'), F.from_user.id == Config.ADMIN_ID)
+async def newsletter_confirm(callback: types.CallbackQuery, callback_data: NewsletterCallback,
+                             state: FSMContext, bot: Bot):
+    admin_id = callback.from_user.id
+
+    data = await _decide_newsletter(callback, callback_data, state, bot, to_state=None,
+                                    footer='✅ Рассылка подтверждена — отправляем…')
+
+    if data is None:
         return
 
-    elif message.text == 'Подтвердить':
-        data = await state.get_data()
-        await state.clear()
+    # Отвечаем сразу: рассылка по большой базе может идти дольше, чем живёт callback_query.
+    await safe_answer_callback(callback, context=f'рассылка запущена admin_id={admin_id}', text='Рассылка запущена.')
 
-        users = await get_users()
+    users = await get_users()
 
-        if users is None:
-            await safe_answer(
-                message,
-                context=f'отсутствие пользователей для рассылки admin_id={message.from_user.id}',
-                text='У бота пока нет ни одного пользователя, поэтому рассылку отправить некому.',
-                reply_markup=get_admin_keyboard()
-            )
-
-            return
-
-        sent = 0
-        not_sent = 0
-
-        for telegram_id, is_active in users:
-            if not is_active:
-                continue
-
-            recipient_key = StorageKey(bot_id=bot.id, chat_id=telegram_id, user_id=telegram_id)
-            recipient_state = await state.storage.get_state(recipient_key)
-            keyboard = get_main_keyboard() if recipient_state is None else None
-
-            try:
-                await bot.send_message(chat_id=telegram_id,
-                                       text=html.escape(data['newsletter']), reply_markup=keyboard)
-                sent += 1
-            except TelegramForbiddenError as error:
-                logger.info("Рассылка: доставка пользователю user_id=%s не удалась (заблокировал бота): %s", telegram_id, error)
-                not_sent += 1
-                await deactivated_user(telegram_id)
-            except TelegramAPIError as error:
-                logger.warning("Рассылка: доставка пользователю user_id=%s не удалась: %s", telegram_id, error)
-                not_sent += 1
-
-            await asyncio.sleep(0.05)
-
-        await safe_answer(
-            message,
-            context=f'итоги рассылки admin_id={message.from_user.id}',
-            text=f'Рассылка завершена\n\n'
-                 f'Отправлено: {sent}\n'
-                 f'Не доставлено (не отправлено): {not_sent}\n\n'
-                 f'Всего пользователей в базе: {len(users)}\n'
-                 f'Из них активных: {sent + not_sent}',
+    if users is None:
+        await safe_send_message(
+            bot, admin_id,
+            context=f'отсутствие пользователей для рассылки admin_id={admin_id}',
+            text='У бота пока нет ни одного пользователя, поэтому рассылку отправить некому.',
             reply_markup=get_admin_keyboard()
         )
 
         return
 
-    elif message.text == 'Изменить':
-        await state.set_state(Newsletter.text)
+    sent = 0
+    not_sent = 0
 
-        await safe_answer(
-            message,
-            context=f'повторный запрос текста рассылки admin_id={message.from_user.id}',
-            text='Введите текст рассылки:',
-            reply_markup=get_cancel_keyboard()
-        )
+    for telegram_id, is_active in users:
+        if not is_active:
+            continue
 
+        recipient_key = StorageKey(bot_id=bot.id, chat_id=telegram_id, user_id=telegram_id)
+        recipient_state = await state.storage.get_state(recipient_key)
+        keyboard = get_main_keyboard() if recipient_state is None else None
+
+        try:
+            await bot.send_message(chat_id=telegram_id,
+                                   text=html.escape(data['newsletter']), reply_markup=keyboard)
+            sent += 1
+        except TelegramForbiddenError as error:
+            logger.info("Рассылка: доставка пользователю user_id=%s не удалась (заблокировал бота): %s", telegram_id, error)
+            not_sent += 1
+            await deactivated_user(telegram_id)
+        except TelegramAPIError as error:
+            logger.warning("Рассылка: доставка пользователю user_id=%s не удалась: %s", telegram_id, error)
+            not_sent += 1
+
+        await asyncio.sleep(0.05)
+
+    await safe_send_message(
+        bot, admin_id,
+        context=f'итоги рассылки admin_id={admin_id}',
+        text=f'Рассылка завершена\n\n'
+             f'Отправлено: {sent}\n'
+             f'Не доставлено (не отправлено): {not_sent}\n\n'
+             f'Всего пользователей в базе: {len(users)}\n'
+             f'Из них активных: {sent + not_sent}',
+        reply_markup=get_admin_keyboard()
+    )
+
+
+@router.callback_query(NewsletterCallback.filter(F.action == 'edit'), F.from_user.id == Config.ADMIN_ID)
+async def newsletter_edit(callback: types.CallbackQuery, callback_data: NewsletterCallback,
+                          state: FSMContext, bot: Bot):
+    admin_id = callback.from_user.id
+
+    data = await _decide_newsletter(callback, callback_data, state, bot, to_state=Newsletter.text,
+                                    footer='✏️ Текст рассылки меняется.')
+
+    if data is None:
         return
+
+    await safe_answer_callback(callback, context=f'изменение рассылки admin_id={admin_id}')
+
+    await safe_send_message(
+        bot, admin_id,
+        context=f'повторный запрос текста рассылки admin_id={admin_id}',
+        text='Введите текст рассылки:',
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+@router.callback_query(NewsletterCallback.filter(F.action == 'cancel'), F.from_user.id == Config.ADMIN_ID)
+async def newsletter_cancel(callback: types.CallbackQuery, callback_data: NewsletterCallback,
+                            state: FSMContext, bot: Bot):
+    admin_id = callback.from_user.id
+
+    data = await _decide_newsletter(callback, callback_data, state, bot, to_state=None,
+                                    footer='❌ Рассылка отменена.')
+
+    if data is None:
+        return
+
+    await safe_answer_callback(callback, context=f'отмена рассылки admin_id={admin_id}', text='Рассылка отменена.')
+
+    await safe_send_message(
+        bot, admin_id,
+        context=f'меню администратора после отмены рассылки admin_id={admin_id}',
+        text='Главное меню администратора.',
+        reply_markup=get_admin_keyboard()
+    )
 
 
 @router.message(ChangeAboutUs.about_us_text,
