@@ -23,3 +23,8 @@ class ChangeAboutUs(StatesGroup):
 class ChangePrice(StatesGroup):
     price = State()
 
+
+class Dialog(StatesGroup):
+    waiting = State()
+    active = State()
+

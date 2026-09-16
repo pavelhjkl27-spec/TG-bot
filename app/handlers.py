@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 import html
 import logging
+import secrets
 
 from aiogram import Router, types, F, Bot
 from aiogram.enums import ContentType
@@ -11,11 +12,14 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.callbacks import DialogCallback
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
-                           get_admin_keyboard, get_sure_keyboard)
-from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice
+                           get_admin_keyboard, get_sure_keyboard,
+                           get_dialog_waiting_keyboard, get_dialog_active_keyboard,
+                           get_dialog_request_markup, get_dialog_status_markup)
+from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice, Dialog
 from config import Config
 from app.db_requests import (add_user,
                              save_user_appeal,
@@ -27,7 +31,8 @@ from app.db_requests import (add_user,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
                              set_price, get_request_text_by_group_message_id)
-from app.utils import exceeds_telegram_limit, safe_answer, safe_send_message
+from app.utils import (exceeds_telegram_limit, safe_answer, safe_send_message,
+                       safe_edit_message_text, safe_answer_callback)
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +275,489 @@ async def send_welcome_menu(message: types.Message, log_context: str) -> None:
         text=WELCOME_MENU_TEXT.format(price=html.escape(price)),
         reply_markup=get_main_keyboard()
     )
+
+
+# ------------------------------------------------------------ Диалог клиент↔админ
+#
+# Источник правды — FSM клиента (Dialog.waiting / Dialog.active, в data: dialog_id,
+# request_message_id, status_message_id). Тема клиента — существующая привязка
+# Users.topic_id. Все переходы, которые может одновременно сделать другая сторона
+# (клиент в личке и админ в группе живут под разными блокировками SimpleEventIsolation),
+# идут через атомарный PostgresStorage.transition_state: уведомления шлёт только тот, кто
+# выиграл переход, проигравший молчит (callback при этом всё равно получает answer).
+#
+# Клиентские хендлеры диалога зарегистрированы ДО cmd_start и menu: в диалоге /start —
+# это корректный выход с уведомлением админа, а любой другой текст (включая тексты кнопок
+# меню) — содержимое диалога, а не команда.
+
+DIALOG_REQUEST_TEXT = (
+    '💬 <b>Клиент запрашивает диалог</b>\n\n'
+    'После подтверждения все ваши сообщения в этой теме будут уходить клиенту напрямую, без Reply.'
+)
+DIALOG_ACTIVE_TEXT = (
+    '🟢 <b>Диалог активен</b>\n\n'
+    'Пишите в эту тему — сообщения уходят клиенту напрямую. Сообщения клиента появятся здесь.'
+)
+
+
+def _client_key(bot: Bot, client_id: int) -> StorageKey:
+    return StorageKey(bot_id=bot.id, chat_id=client_id, user_id=client_id)
+
+
+async def _notify_client(bot: Bot, client_id: int, *, context: str, **send_kwargs) -> bool:
+    """Сообщение клиенту о смене статуса диалога; блокировка бота — deactivated_user, как везде."""
+    try:
+        await bot.send_message(chat_id=client_id, **send_kwargs)
+        return True
+    except TelegramForbiddenError as error:
+        logger.warning("Не удалось отправить [%s] — клиент user_id=%s заблокировал бота: %s", context, client_id, error)
+        await deactivated_user(client_id)
+    except TelegramAPIError as error:
+        logger.warning("Не удалось отправить [%s] user_id=%s: %s", context, client_id, error)
+
+    return False
+
+
+async def _drop_stale_buttons(bot: Bot, callback: types.CallbackQuery) -> None:
+    """Снимает inline-кнопки с сообщения, по которому пришёл уже неактуальный callback."""
+    if callback.message is None:
+        return
+
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None
+        )
+    except TelegramAPIError as error:
+        # Чаще всего "message is not modified": кнопки уже сняты победившей стороной.
+        logger.info("Не удалось снять устаревшие кнопки message_id=%s: %s", callback.message.message_id, error)
+
+
+async def _close_dialog_request(bot: Bot, storage, client_id: int, dialog_id: str, *, by_admin: bool) -> bool:
+    """
+    Dialog.waiting → None: отклонение админом (by_admin=True) или отмена клиентом.
+    Возвращает False, если переход уже сделала другая сторона — тогда ничего не шлёт.
+    """
+    old_data = await storage.transition_state(
+        _client_key(bot, client_id),
+        from_state=Dialog.waiting, match={'dialog_id': dialog_id}, to_state=None, to_data={}
+    )
+
+    if old_data is None:
+        return False
+
+    group_id = await get_group_id()
+    topic_id = await get_user_thread_id(client_id)
+    request_message_id = old_data.get('request_message_id')
+
+    if by_admin:
+        request_result_text = '❌ Запрос отклонён администратором.'
+        client_text = (
+            'К сожалению, сейчас администратор не может начать диалог. '
+            'Вы можете задать вопрос или оставить заявку — мы обязательно ответим.'
+        )
+    else:
+        request_result_text = '❌ Клиент отменил запрос на диалог.'
+        client_text = 'Запрос на диалог отменён.'
+
+    if group_id is not None and request_message_id is not None:
+        await safe_edit_message_text(
+            bot, group_id, request_message_id,
+            context=f'итог запроса на диалог user_id={client_id}',
+            text=f'{DIALOG_REQUEST_TEXT}\n\n{request_result_text}'
+        )
+
+    if not by_admin and group_id is not None and topic_id is not None:
+        await safe_send_message(
+            bot, group_id,
+            context=f'уведомление об отмене запроса на диалог user_id={client_id}',
+            text=request_result_text, message_thread_id=topic_id
+        )
+
+    await _notify_client(
+        bot, client_id,
+        context='закрытие запроса на диалог',
+        text=client_text, reply_markup=get_main_keyboard()
+    )
+
+    return True
+
+
+async def _finish_active_dialog(bot: Bot, storage, client_id: int, dialog_id: str, *, ended_by: str) -> bool:
+    """
+    Dialog.active → None. ended_by: 'client' | 'admin' | 'blocked' (бот заблокирован
+    клиентом — выяснилось при пересылке). Статус-сообщение в теме в любом случае
+    теряет кнопку «Завершить»; вторая сторона получает явное уведомление. Возвращает
+    False (и ничего не шлёт), если диалог уже завершила другая сторона.
+    """
+    old_data = await storage.transition_state(
+        _client_key(bot, client_id),
+        from_state=Dialog.active, match={'dialog_id': dialog_id}, to_state=None, to_data={}
+    )
+
+    if old_data is None:
+        return False
+
+    group_id = await get_group_id()
+    topic_id = await get_user_thread_id(client_id)
+    status_message_id = old_data.get('status_message_id')
+
+    status_texts = {
+        'client': '🔴 <b>Диалог завершён клиентом</b>',
+        'admin': '🔴 <b>Диалог завершён администратором</b>',
+        'blocked': '🔴 <b>Диалог завершён</b>: клиент заблокировал бота',
+    }
+
+    if group_id is not None and status_message_id is not None:
+        await safe_edit_message_text(
+            bot, group_id, status_message_id,
+            context=f'статус завершённого диалога user_id={client_id}',
+            text=status_texts[ended_by]
+        )
+
+    if ended_by == 'admin':
+        await _notify_client(
+            bot, client_id,
+            context='завершение диалога администратором',
+            text='🔴 Администратор завершил диалог. Спасибо за общение!\n\n'
+                 'Если появятся вопросы — воспользуйтесь меню.',
+            reply_markup=get_main_keyboard()
+        )
+
+        return True
+
+    if group_id is not None and topic_id is not None:
+        topic_text = (
+            '🔴 Клиент вышел из диалога. Сообщения в этой теме больше не пересылаются клиенту.'
+            if ended_by == 'client' else
+            '🔴 Клиент заблокировал бота — сообщение не доставлено, диалог завершён.'
+        )
+        await safe_send_message(
+            bot, group_id,
+            context=f'уведомление о завершении диалога ({ended_by}) user_id={client_id}',
+            text=topic_text, message_thread_id=topic_id
+        )
+
+    if ended_by == 'client':
+        await _notify_client(
+            bot, client_id,
+            context='выход клиента из диалога',
+            text='Вы вышли из диалога с администратором.',
+            reply_markup=get_main_keyboard()
+        )
+
+    return True
+
+
+async def _leave_dialog_by_client(message: types.Message, state: FSMContext, bot: Bot) -> bool:
+    """
+    Выход клиента из ожидания/диалога. Возвращает False только в одном случае: клиент
+    отменял запрос, но админ успел его подтвердить — диалог активен, и клиенту об этом
+    явно сказано (иначе он считал бы, что отменил запрос). Вызывающий код в этом случае
+    не должен показывать обычное меню.
+    """
+    client_id = message.from_user.id
+    current_state = await state.get_state()
+    dialog_id = (await state.get_data()).get('dialog_id')
+
+    if dialog_id is None:
+        return True
+
+    if current_state == Dialog.active.state:
+        # Проигрыш перехода здесь означает, что диалог уже завершил админ и сам уведомил клиента.
+        await _finish_active_dialog(bot, state.storage, client_id, dialog_id, ended_by='client')
+        return True
+
+    if current_state != Dialog.waiting.state:
+        return True
+
+    if await _close_dialog_request(bot, state.storage, client_id, dialog_id, by_admin=False):
+        return True
+
+    # Отмена проиграла переход. Из waiting выходят только в None (отклонение — клиент уже
+    # получил ответ) или в active (подтверждение); назад в waiting состояние не возвращается,
+    # поэтому перечитать его после проигрыша безопасно.
+    if (await state.get_state() != Dialog.active.state
+            or (await state.get_data()).get('dialog_id') != dialog_id):
+        return True
+
+    await safe_answer(
+        message,
+        context=f'отмена запроса опоздала — диалог начат user_id={client_id}',
+        text='🟢 Администратор уже подтвердил ваш запрос — диалог начат, отменить его не получилось.\n\n'
+             'Пишите сюда — сообщения уходят администратору напрямую. '
+             'Чтобы закончить, нажмите «Выйти из диалога».',
+        reply_markup=get_dialog_active_keyboard()
+    )
+
+    return False
+
+
+@router.message(F.text == 'Запросить диалог с админом',
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(None))
+async def request_dialog(message: types.Message, state: FSMContext, bot: Bot):
+    user = message.from_user
+
+    group_id = await get_group_id()
+
+    if group_id is None:
+        await safe_answer(
+            message,
+            context=f'группа не привязана (диалог) user_id={user.id}',
+            text='Бот временно не работает, попробуйте позже.'
+        )
+        return
+
+    try:
+        topic_id = await resolve_client_topic(bot, user, group_id)
+    except TopicResolutionError as error:
+        if error.reason == 'not_registered':
+            text = 'Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.'
+        else:
+            text = 'К сожалению, сейчас не получилось отправить запрос. Пожалуйста, попробуйте ещё раз чуть позже.'
+
+        await safe_answer(message, context=f'невозможность создать тему (диалог) user_id={user.id}', text=text)
+        return
+
+    dialog_id = secrets.token_hex(4)
+
+    # Состояние ставится ДО отправки кнопок в группу: иначе админ мог бы нажать
+    # «Подтвердить» раньше, чем появится запись, и получить «запрос неактуален».
+    await state.set_state(Dialog.waiting)
+    await state.set_data({'dialog_id': dialog_id})
+
+    request_message = await safe_send_message(
+        bot, group_id,
+        context=f'запрос на диалог в группу user_id={user.id} topic_id={topic_id}',
+        text=DIALOG_REQUEST_TEXT, message_thread_id=topic_id,
+        reply_markup=get_dialog_request_markup(user.id, dialog_id)
+    )
+
+    if not request_message:
+        await state.clear()
+        await safe_answer(
+            message,
+            context=f'запрос на диалог не доставлен user_id={user.id}',
+            text='Запрос не был доставлен. Попробуйте отправить его ещё раз чуть позже.',
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    await state.storage.update_data_if(
+        _client_key(bot, user.id),
+        match={'dialog_id': dialog_id}, patch={'request_message_id': request_message.message_id}
+    )
+
+    await safe_answer(
+        message,
+        context=f'подтверждение запроса на диалог user_id={user.id}',
+        text='📨 <b>Запрос отправлен</b>\n\n'
+             'Как только администратор подключится, вы получите уведомление и сможете переписываться напрямую.',
+        reply_markup=get_dialog_waiting_keyboard()
+    )
+
+
+@router.message(CommandStart(),
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(Dialog.waiting, Dialog.active))
+async def cmd_start_in_dialog(message: types.Message, state: FSMContext, bot: Bot):
+    if await _leave_dialog_by_client(message, state, bot):
+        await cmd_start(message, state)
+
+
+@router.message(F.text.in_({'Отменить запрос', 'Выйти из диалога'}),
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(Dialog.waiting, Dialog.active))
+async def leave_dialog(message: types.Message, state: FSMContext, bot: Bot):
+    # «Отменить запрос» в Dialog.active (и наоборот) — нажатие по устаревшей клавиатуре,
+    # поэтому выход определяется по состоянию, а не по тексту кнопки.
+    await _leave_dialog_by_client(message, state, bot)
+
+
+@router.message(Dialog.waiting,
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID)
+async def dialog_waiting_hint(message: types.Message):
+    await safe_answer(
+        message,
+        context=f'подсказка ожидания диалога user_id={message.from_user.id}',
+        text='⏳ Ваш запрос на диалог ожидает решения администратора. '
+             'Если передумали — нажмите «Отменить запрос».',
+        reply_markup=get_dialog_waiting_keyboard()
+    )
+
+
+@router.message(Dialog.active,
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID)
+async def forward_client_dialog_message(message: types.Message, bot: Bot):
+    user = message.from_user
+    group_id = await get_group_id()
+    topic_id = await get_user_thread_id(user.id)
+
+    if group_id is None or topic_id is None:
+        logger.error("Активный диалог без группы/темы: user_id=%s group_id=%s topic_id=%s", user.id, group_id, topic_id)
+        await safe_answer(
+            message,
+            context=f'диалог без темы user_id={user.id}',
+            text='Сообщение не доставлено: бот временно не работает. Попробуйте позже.'
+        )
+        return
+
+    try:
+        await message.copy_to(chat_id=group_id, message_thread_id=topic_id)
+    except TelegramAPIError as error:
+        logger.warning("Пересылка сообщения клиента user_id=%s в тему topic_id=%s не удалась: %s", user.id, topic_id, error)
+        await safe_answer(
+            message,
+            context=f'сообщение диалога не доставлено user_id={user.id}',
+            text='Сообщение не доставлено администратору. Попробуйте отправить его ещё раз чуть позже.'
+        )
+
+
+@router.callback_query(DialogCallback.filter(), F.from_user.id != Config.ADMIN_ID)
+async def dialog_callback_not_admin(callback: types.CallbackQuery):
+    await safe_answer_callback(
+        callback,
+        context=f'кнопка диалога не от админа user_id={callback.from_user.id}',
+        text='Эта кнопка доступна только администратору.', show_alert=True
+    )
+
+
+@router.callback_query(DialogCallback.filter(F.action == 'confirm'), F.from_user.id == Config.ADMIN_ID)
+async def dialog_confirm(callback: types.CallbackQuery, callback_data: DialogCallback, bot: Bot, fsm_storage):
+    client_id, dialog_id = callback_data.client_id, callback_data.dialog_id
+    key = _client_key(bot, client_id)
+
+    async def reject_stale():
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'неактуальный запрос на диалог user_id={client_id}',
+                                   text='Запрос уже неактуален.')
+
+    # Дешёвая предпроверка отсекает типичный двойной клик (апдейты одного админа в группе
+    # и так сериализованы) до отправки статус-сообщения. От настоящей гонки с клиентом
+    # защищает только transition_state ниже.
+    if (await fsm_storage.get_state(key) != Dialog.waiting.state
+            or (await fsm_storage.get_data(key)).get('dialog_id') != dialog_id):
+        await reject_stale()
+        return
+
+    group_id = await get_group_id()
+    topic_id = await get_user_thread_id(client_id)
+
+    status_message = None
+
+    # Статус-сообщение отправляется ДО перехода waiting→active: если отправка не удалась,
+    # состояние клиента не трогали вовсе. Раньше переход делался первым и при сбое
+    # откатывался active→waiting — в этом окне «Отменить запрос» клиента проигрывал
+    # переход молча, а после отката запрос оставался висеть.
+    if group_id is not None and topic_id is not None:
+        status_message = await safe_send_message(
+            bot, group_id,
+            context=f'статус активного диалога user_id={client_id}',
+            text=DIALOG_ACTIVE_TEXT, message_thread_id=topic_id,
+            reply_markup=get_dialog_status_markup(client_id, dialog_id)
+        )
+
+    if not status_message:
+        await safe_answer_callback(callback, context=f'статус диалога не отправлен user_id={client_id}',
+                                   text='Не удалось начать диалог. Попробуйте ещё раз.', show_alert=True)
+        return
+
+    old_data = await fsm_storage.transition_state(
+        key, from_state=Dialog.waiting, match={'dialog_id': dialog_id}, to_state=Dialog.active
+    )
+
+    if old_data is None:
+        # Клиент успел отменить запрос (или /start) между предпроверкой и переходом —
+        # он уже получил «Запрос отменён», а тема — уведомление об отмене.
+        await safe_edit_message_text(
+            bot, group_id, status_message.message_id,
+            context=f'статус неначатого диалога user_id={client_id}',
+            text='⚪️ <b>Диалог не начат</b>: клиент отменил запрос'
+        )
+        await reject_stale()
+        return
+
+    linked = await fsm_storage.update_data_if(
+        key, match={'dialog_id': dialog_id}, patch={'status_message_id': status_message.message_id}
+    )
+
+    await safe_edit_message_text(
+        bot, callback.message.chat.id, callback.message.message_id,
+        context=f'подтверждение запроса на диалог user_id={client_id}',
+        text=f'{DIALOG_REQUEST_TEXT}\n\n✅ Запрос подтверждён.'
+    )
+
+    if not linked:
+        # Клиент успел выйти (например, /start) между переходом и записью status_message_id —
+        # его хендлер уже уведомил тему, но снять кнопку со статуса было не по чему.
+        await safe_edit_message_text(
+            bot, group_id, status_message.message_id,
+            context=f'статус диалога, завершённого до старта user_id={client_id}',
+            text='🔴 <b>Диалог завершён клиентом</b>'
+        )
+        await safe_answer_callback(callback, context=f'диалог завершён до старта user_id={client_id}',
+                                   text='Клиент уже вышел из диалога.')
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=client_id,
+            text='🟢 <b>Администратор на связи!</b>\n\n'
+                 'Пишите сюда — сообщения уходят администратору напрямую. '
+                 'Чтобы закончить, нажмите «Выйти из диалога».',
+            reply_markup=get_dialog_active_keyboard()
+        )
+    except TelegramForbiddenError as error:
+        logger.warning("Начало диалога: клиент user_id=%s заблокировал бота: %s", client_id, error)
+        await deactivated_user(client_id)
+        await _finish_active_dialog(bot, fsm_storage, client_id, dialog_id, ended_by='blocked')
+    except TelegramAPIError as error:
+        logger.warning("Начало диалога: не удалось уведомить клиента user_id=%s: %s", client_id, error)
+        await safe_send_message(
+            bot, group_id,
+            context=f'уведомление о недоставке старта диалога user_id={client_id}',
+            text='⚠️ Не удалось уведомить клиента о начале диалога. Ваши сообщения всё равно будут ему пересылаться.',
+            message_thread_id=topic_id
+        )
+
+    await safe_answer_callback(callback, context=f'диалог начат user_id={client_id}', text='Диалог начат.')
+
+
+@router.callback_query(DialogCallback.filter(F.action == 'reject'), F.from_user.id == Config.ADMIN_ID)
+async def dialog_reject(callback: types.CallbackQuery, callback_data: DialogCallback, bot: Bot, fsm_storage):
+    closed = await _close_dialog_request(
+        bot, fsm_storage, callback_data.client_id, callback_data.dialog_id, by_admin=True
+    )
+
+    if not closed:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'неактуальный запрос на диалог user_id={callback_data.client_id}',
+                                   text='Запрос уже неактуален.')
+        return
+
+    await safe_answer_callback(callback, context=f'запрос на диалог отклонён user_id={callback_data.client_id}',
+                               text='Запрос отклонён.')
+
+
+@router.callback_query(DialogCallback.filter(F.action == 'end'), F.from_user.id == Config.ADMIN_ID)
+async def dialog_end(callback: types.CallbackQuery, callback_data: DialogCallback, bot: Bot, fsm_storage):
+    finished = await _finish_active_dialog(
+        bot, fsm_storage, callback_data.client_id, callback_data.dialog_id, ended_by='admin'
+    )
+
+    if not finished:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'диалог уже завершён user_id={callback_data.client_id}',
+                                   text='Диалог уже завершён.')
+        return
+
+    await safe_answer_callback(callback, context=f'диалог завершён user_id={callback_data.client_id}',
+                               text='Диалог завершён.')
 
 
 @router.message(CommandStart(), F.chat.type == 'private')
@@ -579,7 +1067,16 @@ async def admin_instruction(message: types.Message):
         '• Тексты заявок и вопросов сохраняются в базе данных.\n'
         '• Чтобы ответить клиенту, откройте его тему и используйте '
         '<b>«Ответить / Reply»</b> именно на сообщение бота с заявкой или вопросом.\n'
-        '• Обычное сообщение в теме клиенту автоматически не отправляется.\n\n'
+        '• Обычное сообщение в теме клиенту автоматически не отправляется '
+        '(кроме активного диалога — см. ниже).\n\n'
+
+        '<b>Диалог с клиентом</b>\n'
+        '• Клиент может нажать «Запросить диалог с админом» — в его теме появится запрос '
+        'с кнопками «Подтвердить» / «Отклонить».\n'
+        '• После подтверждения в теме появится «🟢 Диалог активен»: пока он активен, любое ваше '
+        'сообщение в теме уходит клиенту напрямую, без Reply, а сообщения клиента приходят в тему.\n'
+        '• Завершить диалог можно кнопкой «Завершить» под статусом; клиент тоже может выйти сам — '
+        'вы получите уведомление в теме.\n\n'
 
         '<b>3. Прайс и раздел «О нас»</b>\n'
         '• Кнопка «Изменить прайс» меняет прайс, который видят пользователи.\n'
@@ -677,6 +1174,56 @@ async def back(message: types.Message, state: FSMContext):
                 "📝 <b>Оформление заявки</b>\n\n"
                 "Пожалуйста, введите ваше <b>имя</b>:"),
             reply_markup=get_cancel_keyboard()
+        )
+
+
+async def active_dialog_in_topic(message: types.Message, bot: Bot, fsm_storage) -> dict | bool:
+    """
+    Фильтр: сообщение пришло в тему клиента в привязанной группе, и у этого клиента сейчас
+    Dialog.active. Передаёт в хендлер client_id и dialog_id. Вне активного диалога не
+    срабатывает — сообщения в теме идут по старому пути (reply_to_message).
+    """
+    group_id = await get_group_id()
+
+    if group_id is None or message.chat.id != group_id:
+        return False
+
+    client_id = await get_user_id(message.message_thread_id)
+
+    if client_id is None:
+        return False
+
+    client_key = _client_key(bot, client_id)
+
+    if await fsm_storage.get_state(client_key) != Dialog.active.state:
+        return False
+
+    dialog_id = (await fsm_storage.get_data(client_key)).get('dialog_id')
+
+    if dialog_id is None:
+        return False
+
+    return {'client_id': client_id, 'dialog_id': dialog_id}
+
+
+@router.message(F.chat.type.in_({'group', 'supergroup'}),
+                F.from_user.id == Config.ADMIN_ID,
+                F.message_thread_id.is_not(None),
+                active_dialog_in_topic)
+async def forward_admin_dialog_message(message: types.Message, bot: Bot, fsm_storage,
+                                       client_id: int, dialog_id: str):
+    try:
+        await message.copy_to(chat_id=client_id)
+    except TelegramForbiddenError as error:
+        logger.warning("Пересылка в диалоге: клиент user_id=%s заблокировал бота: %s", client_id, error)
+        await deactivated_user(client_id)
+        await _finish_active_dialog(bot, fsm_storage, client_id, dialog_id, ended_by='blocked')
+    except TelegramAPIError as error:
+        logger.warning("Пересылка в диалоге клиенту user_id=%s не удалась: %s", client_id, error)
+        await safe_answer(
+            message,
+            context=f'сообщение диалога не доставлено клиенту user_id={client_id}',
+            text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.'
         )
 
 

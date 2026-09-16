@@ -4,7 +4,7 @@ from typing import Any
 from aiogram.exceptions import DataNotDictLikeError
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import BaseStorage, StateType, StorageKey
-from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy import and_, delete, func, literal, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
 from app.database import async_session_maker
@@ -139,6 +139,70 @@ class PostgresStorage(BaseStorage):
             await session.commit()
 
         return dict(new_data)
+
+    async def transition_state(
+        self,
+        key: StorageKey,
+        *,
+        from_state: StateType,
+        match: Mapping[str, Any],
+        to_state: StateType,
+        to_data: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Атомарный compare-and-set: если сейчас state == from_state и data содержит match
+        (JSONB `@>`), записывает to_state (и to_data, если передан; None — data не трогать)
+        и возвращает ПРЕЖНЮЮ data; иначе ничего не меняет и возвращает None.
+
+        Нужен там, где одну и ту же запись одновременно меняют апдейты под РАЗНЫМИ
+        блокировками SimpleEventIsolation (клиент в личке и админ в группе): строка
+        блокируется `SELECT … FOR UPDATE`, поэтому из двух конкурентных переходов
+        выигрывает ровно один, второй видит уже новое состояние и получает None.
+        """
+        from_state = from_state.state if isinstance(from_state, State) else from_state
+        to_state = to_state.state if isinstance(to_state, State) else to_state
+
+        async with self._session_maker() as session:
+            result = await session.execute(
+                select(FsmStorage.data)
+                .where(_key_filter(key), FsmStorage.state == from_state, FsmStorage.data.contains(dict(match)))
+                .with_for_update()
+            )
+            old_data = result.scalar_one_or_none()
+
+            if old_data is None:
+                await session.rollback()
+                return None
+
+            values = {'state': to_state, 'updated_at': func.now()}
+
+            if to_data is not None:
+                values['data'] = dict(to_data)
+
+            await session.execute(update(FsmStorage).where(_key_filter(key)).values(**values))
+            await self._delete_if_empty(session, key)
+            await session.commit()
+
+        return dict(old_data)
+
+    async def update_data_if(self, key: StorageKey, *, match: Mapping[str, Any], patch: Mapping[str, Any]) -> bool:
+        """
+        Поверхностный merge patch в data, только если запись существует и data содержит
+        match. В отличие от update_data (upsert), не воскрешает уже удалённую запись —
+        например, когда диалог успели завершить, пока хендлер слал сообщение в Telegram.
+        """
+        async with self._session_maker() as session:
+            result = await session.execute(
+                update(FsmStorage)
+                .where(_key_filter(key), FsmStorage.data.contains(dict(match)))
+                .values(data=FsmStorage.data.op('||', return_type=JSONB)(literal(dict(patch), JSONB)),
+                        updated_at=func.now())
+                .returning(FsmStorage.id)
+            )
+            updated = result.scalar_one_or_none() is not None
+            await session.commit()
+
+        return updated
 
     @staticmethod
     async def _delete_if_empty(session, key: StorageKey) -> None:

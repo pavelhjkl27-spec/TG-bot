@@ -1,5 +1,7 @@
 from aiogram import types
 
+from app.callbacks import DialogCallback
+
 
 def get_main_keyboard():
     keyboard = types.ReplyKeyboardMarkup(keyboard=[
@@ -9,8 +11,61 @@ def get_main_keyboard():
         ],
         [
             types.KeyboardButton(text='О нас')
+        ],
+        [
+            types.KeyboardButton(text='Запросить диалог с админом')
         ]
     ], resize_keyboard=True)
+
+    return keyboard
+
+
+def get_dialog_waiting_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(keyboard=[
+        [
+            types.KeyboardButton(text='Отменить запрос')
+        ]
+    ], resize_keyboard=True)
+
+    return keyboard
+
+
+def get_dialog_active_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(keyboard=[
+        [
+            types.KeyboardButton(text='Выйти из диалога')
+        ]
+    ], resize_keyboard=True)
+
+    return keyboard
+
+
+def get_dialog_request_markup(client_id: int, dialog_id: str):
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(
+                text='Подтвердить',
+                callback_data=DialogCallback(action='confirm', client_id=client_id, dialog_id=dialog_id).pack()
+            ),
+            types.InlineKeyboardButton(
+                text='Отклонить',
+                callback_data=DialogCallback(action='reject', client_id=client_id, dialog_id=dialog_id).pack()
+            ),
+        ]
+    ])
+
+    return keyboard
+
+
+def get_dialog_status_markup(client_id: int, dialog_id: str):
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(
+                text='Завершить',
+                callback_data=DialogCallback(action='end', client_id=client_id, dialog_id=dialog_id).pack()
+            ),
+        ]
+    ])
 
     return keyboard
 
