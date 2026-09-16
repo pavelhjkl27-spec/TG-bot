@@ -766,12 +766,13 @@ async def reply_to_message(message: types.Message, bot: Bot):
     try:
         await bot.send_message(chat_id=user_id, text=context_text)
     except TelegramForbiddenError as error:
-        logger.error("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
+        logger.warning("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
         await safe_answer(message, context=f'уведомление о блокировке admin_id={message.from_user.id}',
                            text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.')
+        await deactivated_user(user_id)
         return
     except TelegramAPIError as error:
-        logger.error("Доставка ответа админа пользователю user_id=%s не удалась: %s", user_id, error)
+        logger.warning("Доставка ответа админа пользователю user_id=%s не удалась: %s", user_id, error)
         await safe_answer(message, context=f'уведомление о недоставке admin_id={message.from_user.id}',
                            text='Не удалось доставить сообщение клиенту. Попробуйте отправить его ещё раз чуть позже.')
         return
@@ -797,9 +798,10 @@ async def reply_to_message(message: types.Message, bot: Bot):
     try:
         await message.copy_to(chat_id=user_id, **copy_kwargs)
     except TelegramForbiddenError as error:
-        logger.error("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
+        logger.warning("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
         await safe_answer(message, context=f'уведомление о блокировке (содержимое) admin_id={message.from_user.id}',
                            text='Пользователь заблокировал бота, поэтому ваше сообщение не доставлено.')
+        await deactivated_user(user_id)
         return
     except TelegramAPIError as error:
         logger.error(
