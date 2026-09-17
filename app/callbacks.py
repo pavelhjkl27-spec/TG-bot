@@ -28,3 +28,16 @@ class NewsletterCallback(CallbackData, prefix='newsletter'):
     """
     action: str
     draft_id: str
+
+
+class OrderStatusCallback(CallbackData, prefix='order'):
+    """
+    Inline-кнопки статуса под карточкой заявки в теме клиента: `order:<action>`.
+
+    action — 'accept' (new → in_progress) или 'done' (in_progress → done). Заявка определяется не по
+    callback_data, а по самой карточке: callback.message.message_id == Requests.group_message_id
+    (карточка уходит в группу раньше, чем появляется строка Requests). Переход — атомарный условный
+    UPDATE на requests (не FSM): повторное, позднее или гоночное нажатие не совпадёт по ожидаемому
+    статусу и ничего не изменит.
+    """
+    action: str

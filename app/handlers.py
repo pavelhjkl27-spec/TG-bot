@@ -12,13 +12,14 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.callbacks import DialogCallback, NewsletterCallback
+from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
                            get_admin_keyboard, get_newsletter_confirm_markup,
                            get_dialog_waiting_keyboard, get_dialog_active_keyboard,
-                           get_dialog_request_markup, get_dialog_status_markup)
+                           get_dialog_request_markup, get_dialog_status_markup,
+                           get_order_status_markup)
 from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice, Dialog
 from config import Config
 from app.db_requests import (add_user,
@@ -31,7 +32,8 @@ from app.db_requests import (add_user,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
                              set_price, get_request_text_by_group_message_id,
-                             get_bid_history_by_thread_id)
+                             get_bid_history_by_thread_id,
+                             transition_request_status, get_bid_card_by_group_message_id)
 from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, safe_answer, safe_send_message,
                        safe_edit_message_text, safe_answer_callback)
 
@@ -173,6 +175,7 @@ async def _deliver_client_submission(
     success_text: str,
     name: str | None = None,
     birthday: str | None = None,
+    reply_markup: types.InlineKeyboardMarkup | None = None,
 ) -> None:
     """
     Общий хвост отправки заявки/вопроса: резолвит (или создаёт) тему клиента,
@@ -196,7 +199,7 @@ async def _deliver_client_submission(
     delivered_message = await safe_send_message(
         bot, group_id,
         context=f'обращение (type={appeal_type}) в группу user_id={user.id} topic_id={topic_id}',
-        text=final_text, message_thread_id=topic_id
+        text=final_text, message_thread_id=topic_id, reply_markup=reply_markup
     )
 
     if not delivered_message:
@@ -257,6 +260,53 @@ async def _deliver_client_submission(
     )
 
 
+BID_CARD_HEADER = "🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
+BID_CARD_TRUNCATED = '…'
+
+ORDER_STATUS_LABELS = {
+    'new': '🆕 Новая',
+    'in_progress': '🛠 В работе',
+    'done': '✔️ Готово',
+}
+
+
+def _bid_card_text(name: str, birthday: str, text: str, status: str | None = None) -> str:
+    """
+    Карточка заявки в теме клиента. Без status (или со status='new') — ровно тот текст, что
+    уходит при подаче заявки. Для in_progress/done добавляется строка статуса; если с ней карточка
+    перестаёт влезать в лимит Telegram (текст заявки проверен на лимит без неё), обрезается только
+    показ текста клиента — по исходным символам, чтобы не разорвать HTML-сущность.
+    """
+    prefix = (
+        f"{BID_CARD_HEADER}"
+        f"👤 <b>Имя:</b> {html.escape(name)}\n"
+        f"📅 <b>Дата рождения:</b> {html.escape(birthday)}\n\n"
+        f"💬 <b>Обращение:</b>\n"
+    )
+    status_part = '' if status in (None, 'new') \
+        else f"\n\n📌 <b>Статус:</b> {ORDER_STATUS_LABELS.get(status, status)}"
+    escaped = html.escape(text)
+
+    # Без строки статуса текст не обрезается: save_statement проверяет лимит именно на нём.
+    if not status_part or len(prefix) + len('<i></i>') + len(escaped) + len(status_part) <= TELEGRAM_MESSAGE_LIMIT:
+        return f"{prefix}<i>{escaped}</i>{status_part}"
+
+    budget = TELEGRAM_MESSAGE_LIMIT - len(prefix) - len('<i></i>') - len(BID_CARD_TRUNCATED) - len(status_part)
+    pieces = []
+    used = 0
+
+    for char in text:
+        escaped_char = html.escape(char)
+
+        if used + len(escaped_char) > budget:
+            break
+
+        pieces.append(escaped_char)
+        used += len(escaped_char)
+
+    return f"{prefix}<i>{''.join(pieces)}{BID_CARD_TRUNCATED}</i>{status_part}"
+
+
 WELCOME_MENU_TEXT = (
     "👋 <b>Добро пожаловать!</b>\n\n"
     "💰 Актуальные цены на разборы:\n<b>{price}</b>\n\n"
@@ -307,7 +357,7 @@ def _client_key(bot: Bot, client_id: int) -> StorageKey:
 
 
 async def _notify_client(bot: Bot, client_id: int, *, context: str, **send_kwargs) -> bool:
-    """Сообщение клиенту о смене статуса диалога; блокировка бота — deactivated_user, как везде."""
+    """Сообщение клиенту о смене статуса диалога или заказа; блокировка бота — deactivated_user, как везде."""
     try:
         await bot.send_message(chat_id=client_id, **send_kwargs)
         return True
@@ -890,10 +940,11 @@ def _history_message_texts(history: list) -> list[str]:
     header = '🗂 <b>История заказов клиента</b>'
     entries = []
 
-    for created_at, text_value in history:
+    for created_at, text_value, status in history:
         preview = text_value if len(text_value) <= HISTORY_PREVIEW_MAX_LENGTH \
             else text_value[:HISTORY_PREVIEW_MAX_LENGTH] + '…'
-        entries.append(f'📅 {created_at.strftime("%d.%m.%Y %H:%M")}\n{html.escape(preview)}')
+        status_label = ORDER_STATUS_LABELS.get(status, status)
+        entries.append(f'📅 {created_at.strftime("%d.%m.%Y %H:%M")} · {status_label}\n{html.escape(preview)}')
 
     messages = []
     current = header
@@ -963,6 +1014,104 @@ async def client_history(message: types.Message):
             context=f'/history сообщение thread_id={message.message_thread_id}',
             text=chunk
         )
+
+
+# ------------------------------------------------------------ Статус заказа
+#
+# Кнопки под карточкой заявки (Bid) в теме клиента: «Принято в работу» (new → in_progress) и
+# «Готово» (in_progress → done). Статус — поле Requests.status, не FSM: переход — атомарный условный
+# UPDATE на requests (transition_request_status). Заявка ищется по самой карточке
+# (callback.message.message_id == Requests.group_message_id). Уведомляет клиента и правит карточку
+# только выигравший переход; проигравший (повтор, позднее или гоночное нажатие) лишь приводит кнопки
+# к актуальному статусу и получает answer.
+
+ORDER_STALE_TEXT = 'Статус этой заявки уже изменён.'
+ORDER_CLIENT_TEXTS = {
+    'in_progress': (
+        '🛠 <b>Ваша заявка в работе!</b>\n\n'
+        'Мы начали готовить разбор по заявке от {date}. Как только он будет готов — сразу напишем вам здесь.'
+    ),
+    'done': (
+        '✨ <b>Ваш разбор готов!</b>\n\n'
+        'Работа по заявке от {date} завершена. Если появятся вопросы — просто воспользуйтесь меню.'
+    ),
+}
+
+
+async def _change_order_status(callback: types.CallbackQuery, bot: Bot, *, from_status: str, to_status: str) -> None:
+    card = callback.message
+    group_id = await get_group_id()
+
+    if card is None or group_id is None or card.chat.id != group_id:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'кнопка статуса вне рабочей группы admin_id={callback.from_user.id}',
+                                   text='Заявка не найдена.')
+        return
+
+    changed = await transition_request_status(card.message_id, from_status, to_status)
+
+    if changed is None:
+        current = await get_bid_card_by_group_message_id(card.message_id)
+
+        if current is None:
+            await _drop_stale_buttons(bot, callback)
+            await safe_answer_callback(callback, context=f'кнопка статуса без заявки message_id={card.message_id}',
+                                       text='Заявка не найдена.')
+            return
+
+        await safe_edit_message_text(
+            bot, card.chat.id, card.message_id,
+            context=f'актуализация карточки заявки message_id={card.message_id}',
+            text=_bid_card_text(current.name, current.birthday, current.text, current.status),
+            reply_markup=get_order_status_markup(current.status)
+        )
+        await safe_answer_callback(callback, context=f'неактуальная кнопка статуса message_id={card.message_id}',
+                                   text=ORDER_STALE_TEXT)
+        return
+
+    client_id = changed.telegram_id
+
+    await safe_edit_message_text(
+        bot, card.chat.id, card.message_id,
+        context=f'карточка заявки после смены статуса на {to_status} user_id={client_id}',
+        text=_bid_card_text(changed.name, changed.birthday, changed.text, to_status),
+        reply_markup=get_order_status_markup(to_status)
+    )
+
+    notified = await _notify_client(
+        bot, client_id,
+        context=f'уведомление о статусе заказа {to_status} user_id={client_id}',
+        text=ORDER_CLIENT_TEXTS[to_status].format(date=changed.created_at.strftime('%d.%m.%Y'))
+    )
+
+    if notified:
+        await safe_answer_callback(callback, context=f'статус заказа {to_status} user_id={client_id}',
+                                   text='Статус обновлён, клиент уведомлён.')
+    else:
+        await safe_answer_callback(
+            callback, context=f'статус заказа {to_status} без уведомления user_id={client_id}',
+            text='Статус обновлён, но клиент не получил уведомление (возможно, заблокировал бота).',
+            show_alert=True
+        )
+
+
+@router.callback_query(OrderStatusCallback.filter(), F.from_user.id != Config.ADMIN_ID)
+async def order_callback_not_admin(callback: types.CallbackQuery):
+    await safe_answer_callback(
+        callback,
+        context=f'кнопка статуса заказа не от админа user_id={callback.from_user.id}',
+        text='Эта кнопка доступна только администратору.', show_alert=True
+    )
+
+
+@router.callback_query(OrderStatusCallback.filter(F.action == 'accept'), F.from_user.id == Config.ADMIN_ID)
+async def order_accept(callback: types.CallbackQuery, bot: Bot):
+    await _change_order_status(callback, bot, from_status='new', to_status='in_progress')
+
+
+@router.callback_query(OrderStatusCallback.filter(F.action == 'done'), F.from_user.id == Config.ADMIN_ID)
+async def order_done(callback: types.CallbackQuery, bot: Bot):
+    await _change_order_status(callback, bot, from_status='in_progress', to_status='done')
 
 
 @router.my_chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
@@ -1557,13 +1706,7 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
     await state.update_data(text=message.text)
     data = await state.get_data()
 
-    final_text = (
-        f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
-        f"👤 <b>Имя:</b> {html.escape(data['name'])}\n"
-        f"📅 <b>Дата рождения:</b> {html.escape(data['birthday'])}\n\n"
-        f"💬 <b>Обращение:</b>\n"
-        f"<i>{html.escape(data['text'])}</i>"
-    )
+    final_text = _bid_card_text(data['name'], data['birthday'], data['text'])
 
     overflow = exceeds_telegram_limit(final_text)
 
@@ -1598,6 +1741,7 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         user=user, group_id=group_id, final_text=final_text,
         appeal_type='Bid', save_text=message.text,
         name=data['name'], birthday=data['birthday'],
+        reply_markup=get_order_status_markup('new'),
         telegram_error_text='К сожалению, сейчас не получилось отправить заявку. Пожалуйста, попробуйте ещё раз чуть позже.',
         db_error_text='Не получилось обработать вашу заявку. Пожалуйста, отправьте её ещё раз через несколько минут.',
         not_registered_text='Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.',

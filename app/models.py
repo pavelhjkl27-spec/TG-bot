@@ -29,6 +29,9 @@ class Requests(Base):
     birthday = Column(String(10), nullable=True)
     text = Column(Text, nullable=False)
     group_message_id = Column(Integer, unique=True, nullable=True)
+    # 'new' | 'in_progress' | 'done' — статус заказа (кнопки под карточкой заявки в теме).
+    # server_default, а не ORM-default: строки, созданные до колонки, миграция пометила 'done'.
+    status = Column(String(20), nullable=False, server_default='new')
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda _: datetime.now(timezone.utc))
 
     user = relationship('Users', back_populates='requests')

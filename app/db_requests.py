@@ -1,7 +1,7 @@
 from app.models import Users, Settings, Requests
 from app.database import async_session_maker
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 _SETTINGS_QUERY = select(Settings).where(Settings.id == 1)
 
@@ -94,7 +94,7 @@ async def get_bid_history_by_thread_id(thread_id):
     """
     Клиент резолвится тем же способом, что и в get_user_id (Users.topic_id == thread_id),
     без изобретения нового способа связи темы форума с клиентом. Возвращает None, если
-    тема ни к одному клиенту не привязана, иначе список (created_at, text) записей
+    тема ни к одному клиенту не привязана, иначе список (created_at, text, status) записей
     Requests.type == 'Bid' этого клиента в хронологическом порядке (может быть пустым).
     """
     query = select(Users.id).where(Users.topic_id == thread_id)
@@ -107,13 +107,56 @@ async def get_bid_history_by_thread_id(thread_id):
             return None
 
         requests_query = (
-            select(Requests.created_at, Requests.text)
+            select(Requests.created_at, Requests.text, Requests.status)
             .where(Requests.user_id == user_pk, Requests.type == 'Bid')
             .order_by(Requests.created_at)
         )
         result = await session.execute(requests_query)
 
         return result.all()
+
+
+async def transition_request_status(group_message_id, from_status, to_status):
+    """
+    Атомарный CAS статуса заказа прямо на requests (не FSM): UPDATE ... WHERE group_message_id = ?
+    AND status = from_status. Конкурентный UPDATE той же строки ждёт коммита первого, перепроверяет
+    status и обновляет 0 строк. Данные для карточки и клиента берутся тем же выражением (RETURNING),
+    в той же транзакции. Возвращает строку (name, birthday, text, created_at, telegram_id), если
+    обновилась ровно одна заявка, иначе None (статус уже не тот или такой карточки нет).
+    """
+    query = (
+        update(Requests)
+        .where(Requests.group_message_id == group_message_id,
+               Requests.type == 'Bid',
+               Requests.status == from_status,
+               Users.id == Requests.user_id)
+        .values(status=to_status)
+        .returning(Requests.name, Requests.birthday, Requests.text, Requests.created_at, Users.telegram_id)
+    )
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+        rows = result.all()
+
+        if len(rows) != 1:
+            await session.rollback()
+            return None
+
+        await session.commit()
+
+        return rows[0]
+
+
+async def get_bid_card_by_group_message_id(group_message_id):
+    """(status, name, birthday, text) заявки по её карточке в группе или None."""
+    query = select(Requests.status, Requests.name, Requests.birthday, Requests.text).where(
+        Requests.group_message_id == group_message_id, Requests.type == 'Bid'
+    )
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        return result.one_or_none()
 
 
 async def get_user_thread_id(user_id):

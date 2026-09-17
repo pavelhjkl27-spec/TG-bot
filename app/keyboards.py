@@ -1,6 +1,6 @@
 from aiogram import types
 
-from app.callbacks import DialogCallback, NewsletterCallback
+from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback
 
 
 def get_main_keyboard():
@@ -125,6 +125,24 @@ def get_newsletter_confirm_markup(draft_id: str):
                 text='Отменить',
                 callback_data=NewsletterCallback(action='cancel', draft_id=draft_id).pack()
             ),
+        ]
+    ])
+
+    return keyboard
+
+
+def get_order_status_markup(status: str):
+    """Кнопка под карточкой заявки для её текущего статуса; у 'done' кнопок нет (None)."""
+    if status == 'new':
+        text, action = '✅ Принято в работу', 'accept'
+    elif status == 'in_progress':
+        text, action = '✔️ Готово', 'done'
+    else:
+        return None
+
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text=text, callback_data=OrderStatusCallback(action=action).pack()),
         ]
     ])
 

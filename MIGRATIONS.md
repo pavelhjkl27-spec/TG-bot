@@ -7,7 +7,9 @@
   Отдельно URL нигде не задаётся.
 - Миграции: `migrations/versions/`:
   - `22fe4fd8bb35_baseline` — схема на момент перехода на Alembic;
-  - `3b877d403a8d_fsm_storage` — таблица `fsm_storage` (персистентное FSM, `app/fsm_storage.py`).
+  - `3b877d403a8d_fsm_storage` — таблица `fsm_storage` (персистентное FSM, `app/fsm_storage.py`);
+  - `4c97cc33d868_request_status` — колонка `requests.status`: уже существующие строки получают `done`
+    (`server_default='done'` в `add_column`), затем дефолт переключается на `new` для новых заявок.
 - **Разметка старой базы — всегда на baseline (`alembic stamp 22fe4fd8bb35`), не на `head`.** `stamp head`
   пометил бы как применённые и все более поздние миграции, хотя их таблиц (например, `fsm_storage`) в
   базе нет — бот стартовал бы и падал на первом обращении к ним.
@@ -33,7 +35,7 @@
 python run.py            # сам выполнит upgrade head
 # или без бота:
 alembic upgrade head
-alembic current          # -> 3b877d403a8d (head)
+alembic current          # -> 4c97cc33d868 (head)
 ```
 
 **Старая dev-база, созданная через `create_all`**: бот откажется стартовать с `UnstampedDatabaseError`.
@@ -132,7 +134,7 @@ docker compose logs --tail 30 bot
 на месте и что база теперь на head:
 
 ```bash
-docker compose run --rm bot alembic current     # -> 3b877d403a8d (head)
+docker compose run --rm bot alembic current     # -> 4c97cc33d868 (head)
 docker compose run --rm bot alembic check       # -> No new upgrade operations detected.
 docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT (SELECT count(*) FROM users) AS users, (SELECT count(*) FROM requests) AS requests, (SELECT version_num FROM alembic_version) AS alembic;"'
 ```
