@@ -207,6 +207,32 @@ async def set_user_thread_id(user_id, topic_id):
         return True
 
 
+async def clear_user_thread_id(user_id, topic_id):
+    """
+    Сбрасывает привязку клиента к теме, которой больше нет в Telegram, чтобы
+    следующее обращение создало новую тему с нуля.
+
+    Условный UPDATE (… AND topic_id = :topic_id): сбрасываем ровно ту тему,
+    на которой споткнулась отправка. Если параллельная попытка того же клиента
+    уже успела привязать новую тему, условие не совпадёт и свежая привязка
+    уцелеет. Возвращает True, если строка действительно сброшена.
+    """
+    query = (
+        update(Users)
+        .where(Users.telegram_id == user_id, Users.topic_id == topic_id)
+        .values(topic_id=None)
+        .returning(Users.id)
+    )
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+        cleared = result.scalar_one_or_none()
+
+        await session.commit()
+
+        return cleared is not None
+
+
 async def get_user_id(message_thread_id):
     query = select(Users).where(Users.topic_id == message_thread_id)
 

@@ -9,7 +9,7 @@ from aiogram.enums import ContentType
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback
@@ -26,7 +26,7 @@ from app.db_requests import (add_user,
                              save_user_appeal,
                              get_user_thread_id,
                              get_topic_name,
-                             set_user_thread_id, get_user_id,
+                             set_user_thread_id, clear_user_thread_id, get_user_id,
                              save_group_id, get_group_id,
                              get_about_us, get_users,
                              activated_user, deactivated_user,
@@ -34,8 +34,9 @@ from app.db_requests import (add_user,
                              set_price, get_request_text_by_group_message_id,
                              get_bid_history_by_thread_id,
                              transition_request_status, get_bid_card_by_group_message_id)
-from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, safe_answer, safe_send_message,
-                       safe_edit_message_text, safe_answer_callback)
+from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, is_dead_topic_error, safe_answer,
+                       safe_send_message, send_message_capturing_error, safe_edit_message_text,
+                       safe_answer_callback)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,19 @@ async def resolve_client_topic(bot: Bot, user: types.User, group_id: int) -> int
 
         try:
             topic = await bot.create_forum_topic(chat_id=group_id, name=topic_name)
-        except (TelegramBadRequest, TelegramRetryAfter):
+        except TelegramAPIError as error:
+            # Именно TelegramAPIError, а не (TelegramBadRequest, TelegramRetryAfter):
+            # TelegramForbiddenError (бота выгнали из группы), TelegramNotFound (группы
+            # больше нет), TelegramNetworkError (обычный таймаут до api.telegram.org) и
+            # TelegramServerError — БРАТЬЯ TelegramBadRequest в иерархии aiogram, а не его
+            # наследники, поэтому раньше пролетали мимо и оставляли клиента вообще без
+            # ответа. TelegramRetryAfter отдельной ветки не требует: ожидание и до трёх
+            # повторов делает retry_after_middleware на уровне сессии бота (run.py), и
+            # сюда исключение доходит уже с исчерпанными попытками.
+            logger.error(
+                "Не удалось создать тему '%s' для user_id=%s в группе group_id=%s: %s: %s",
+                topic_name, user.id, group_id, type(error).__name__, error
+            )
             raise TopicResolutionError('telegram_error')
 
         topic_id = topic.message_thread_id
@@ -158,6 +171,56 @@ async def resolve_client_topic(bot: Bot, user: types.User, group_id: int) -> int
     return topic_id
 
 
+DEAD_TOPIC_ADMIN_NOTICE = (
+    "⚠️ <b>Тема клиента недоступна</b>\n\n"
+    "Обращение клиента <b>{client}</b> (id <code>{user_id}</code>) не удалось доставить: его тема "
+    "в группе больше не существует — скорее всего, её удалили вручную.\n\n"
+    "Привязка к удалённой теме сброшена: при следующей попытке клиента бот создаст ему новую тему. "
+    "Клиента уже попросили отправить обращение ещё раз, само обращение сейчас <b>не сохранено</b>.\n\n"
+    "<i>Переписка из удалённой темы не восстанавливается.</i>"
+)
+
+
+async def _heal_dead_topic(bot: Bot, user: types.User, topic_id: int) -> None:
+    """
+    Тема клиента есть в БД, но в Telegram её уже нет (удалили вручную). Без
+    сброса привязки каждое следующее обращение этого клиента падало бы в ту же
+    несуществующую тему — бесконечный цикл «не доставлено» без шанса
+    самовосстановиться. Сбрасываем Users.topic_id (следующая попытка пойдёт
+    штатным путём resolve_client_topic и создаст новую тему) и сообщаем админу,
+    чтобы он не узнал о поломке от клиента.
+    """
+    logger.error(
+        "Тема topic_id=%s клиента user_id=%s недоступна в Telegram (удалена?) — сбрасываем привязку, "
+        "следующее обращение создаст новую тему",
+        topic_id, user.id
+    )
+
+    try:
+        cleared = await clear_user_thread_id(user.id, topic_id)
+    except SQLAlchemyError as error:
+        logger.error(
+            "Не удалось сбросить topic_id=%s у user_id=%s после недоступной темы (ошибка БД): %s",
+            topic_id, user.id, error
+        )
+        return
+
+    if not cleared:
+        # Привязку уже сбросила (или заменила) параллельная попытка того же клиента —
+        # второе уведомление админу о том же инциденте не нужно.
+        logger.info(
+            "topic_id=%s у user_id=%s к моменту сброса уже был изменён — уведомление админу не дублируем",
+            topic_id, user.id
+        )
+        return
+
+    await safe_send_message(
+        bot, Config.ADMIN_ID,
+        context=f'уведомление админу о недоступной теме user_id={user.id} topic_id={topic_id}',
+        text=DEAD_TOPIC_ADMIN_NOTICE.format(client=html.escape(user.full_name), user_id=user.id)
+    )
+
+
 async def _deliver_client_submission(
     message: types.Message,
     state: FSMContext,
@@ -196,13 +259,16 @@ async def _deliver_client_submission(
         await safe_answer(message, context=f'невозможность создать тему user_id={user.id}', text=text)
         return
 
-    delivered_message = await safe_send_message(
+    delivered_message, send_error = await send_message_capturing_error(
         bot, group_id,
         context=f'обращение (type={appeal_type}) в группу user_id={user.id} topic_id={topic_id}',
         text=final_text, message_thread_id=topic_id, reply_markup=reply_markup
     )
 
     if not delivered_message:
+        if send_error is not None and is_dead_topic_error(send_error):
+            await _heal_dead_topic(bot, user, topic_id)
+
         await safe_answer(message, context=f'уведомление о недоставке user_id={user.id}', text=undelivered_text)
         return
 
@@ -1177,6 +1243,53 @@ async def bot_removed_from_chat(event: types.ChatMemberUpdated):
         return
 
     await deactivated_user(user.id)
+
+
+GROUP_REMOVAL_ADMIN_NOTICE = (
+    "🚨 <b>Бот удалён из рабочей группы</b>\n\n"
+    "Бот больше не состоит в группе, куда приходят заявки и вопросы, поэтому доставить новое "
+    "обращение клиента сейчас невозможно — клиенты будут получать ошибку.\n\n"
+    "Чтобы всё заработало снова: добавьте бота обратно в <b>ту же самую</b> группу и выдайте ему права "
+    "администратора с разрешением «Управление темами».\n\n"
+    "<i>Привязка группы сохранена вместе с темами клиентов — повторный /bind не нужен.</i>"
+)
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(IS_MEMBER >> IS_NOT_MEMBER),
+                    F.chat.type != 'private')
+async def bot_removed_from_group(event: types.ChatMemberUpdated, bot: Bot):
+    """
+    Бота выгнали (или он вышел) из группы. Пока это рабочая группа, молчать нельзя:
+    все дальнейшие обращения клиентов будут падать, а админ узнал бы об этом только
+    из жалоб. Привязку (Settings.group_id) намеренно НЕ сбрасываем: она же держит
+    связь тем клиентов с группой, а /bind требует, чтобы бот уже был в группе —
+    сброс лишь потребовал бы привязывать заново и осиротил бы Users.topic_id. При
+    возврате бота в ту же группу bot_added_to_chat увидит совпадение с group_id и
+    ничего лишнего не сделает.
+    """
+    group_id = await get_group_id()
+
+    if group_id is None or event.chat.id != group_id:
+        # Чужой чат: bot_added_to_chat сразу выходит из любой группы, кроме рабочей,
+        # так что штатно сюда попадает разве что этот собственный выход — он ничего
+        # не ломает и админу не интересен.
+        logger.info(
+            "Бот удалён из постороннего чата chat_id=%s (рабочая группа group_id=%s) — реакции не требуется",
+            event.chat.id, group_id
+        )
+        return
+
+    logger.error(
+        "Бот удалён из рабочей группы group_id=%s (инициатор user_id=%s) — доставка обращений клиентов "
+        "остановлена до возврата бота в группу; привязка group_id сохранена",
+        event.chat.id, event.from_user.id if event.from_user else None
+    )
+
+    await safe_send_message(
+        bot, Config.ADMIN_ID,
+        context=f'уведомление админу об удалении бота из рабочей группы group_id={event.chat.id}',
+        text=GROUP_REMOVAL_ADMIN_NOTICE
+    )
 
 
 @router.message(F.text == 'Оставить заявку',
