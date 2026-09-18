@@ -31,12 +31,12 @@ from app.db_requests import (add_user,
                              get_about_us, get_users,
                              activated_user, deactivated_user,
                              set_about_us_text, get_price,
-                             set_price, get_request_text_by_group_message_id,
+                             set_price, get_reply_target_by_group_message_id,
                              get_bid_history_by_thread_id,
                              transition_request_status, get_bid_card_by_group_message_id)
 from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, is_dead_topic_error, safe_answer,
                        safe_send_message, send_message_capturing_error, safe_edit_message_text,
-                       safe_answer_callback)
+                       safe_answer_callback, telegram_text_length, format_client_date)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,6 @@ SAVE_APPEAL_ATTEMPTS = 3
 SAVE_APPEAL_RETRY_DELAY_SECONDS = 0.5
 
 CLIENT_QUOTE_MAX_LENGTH = 150
-LEGACY_QUOTE_MAX_LENGTH = 2500
 HISTORY_PREVIEW_MAX_LENGTH = 150
 
 # Типы контента, для которых Bot API вообще поддерживает caption у copyMessage —
@@ -354,21 +353,21 @@ def _bid_card_text(name: str, birthday: str, text: str, status: str | None = Non
     escaped = html.escape(text)
 
     # Без строки статуса текст не обрезается: save_statement проверяет лимит именно на нём.
-    if not status_part or len(prefix) + len('<i></i>') + len(escaped) + len(status_part) <= TELEGRAM_MESSAGE_LIMIT:
+    if not status_part or telegram_text_length(f"{prefix}<i>{escaped}</i>{status_part}") <= TELEGRAM_MESSAGE_LIMIT:
         return f"{prefix}<i>{escaped}</i>{status_part}"
 
-    budget = TELEGRAM_MESSAGE_LIMIT - len(prefix) - len('<i></i>') - len(BID_CARD_TRUNCATED) - len(status_part)
+    budget = TELEGRAM_MESSAGE_LIMIT - telegram_text_length(f"{prefix}<i>{BID_CARD_TRUNCATED}</i>{status_part}")
     pieces = []
     used = 0
 
     for char in text:
         escaped_char = html.escape(char)
 
-        if used + len(escaped_char) > budget:
+        if used + telegram_text_length(escaped_char) > budget:
             break
 
         pieces.append(escaped_char)
-        used += len(escaped_char)
+        used += telegram_text_length(escaped_char)
 
     return f"{prefix}<i>{''.join(pieces)}{BID_CARD_TRUNCATED}</i>{status_part}"
 
@@ -1147,7 +1146,7 @@ async def _change_order_status(callback: types.CallbackQuery, bot: Bot, *, from_
     notified = await _notify_client(
         bot, client_id,
         context=f'уведомление о статусе заказа {to_status} user_id={client_id}',
-        text=ORDER_CLIENT_TEXTS[to_status].format(date=changed.created_at.strftime('%d.%m.%Y'))
+        text=ORDER_CLIENT_TEXTS[to_status].format(date=format_client_date(changed.created_at))
     )
 
     if notified:
@@ -1578,6 +1577,16 @@ async def forward_admin_dialog_message(message: types.Message, bot: Bot, fsm_sto
         )
 
 
+REPLY_NOT_CLIENT_CARD_TEXT = (
+    'Ответ доходит клиенту, только если сделать Reply на карточку его заявки или вопроса. '
+    'Это служебное сообщение бота — клиенту ничего не отправлено.'
+)
+REPLY_FOREIGN_CARD_TEXT = (
+    'Это сообщение относится к другому клиенту, поэтому ответ не отправлен. '
+    'Сделайте Reply на карточку заявки или вопроса в теме нужного клиента.'
+)
+
+
 @router.message(F.reply_to_message,
                 F.from_user.id == Config.ADMIN_ID,
                 F.message_thread_id.is_not(None))
@@ -1615,6 +1624,23 @@ async def reply_to_message(message: types.Message, bot: Bot):
         )
         return
 
+    # Страховка: по Bot API reply_to_message заполняется только для ответа в той же ветке
+    # (ответ на сообщение из другой темы приходит в external_reply), но клиента мы берём
+    # по теме, где пишет админ, а цитату — по процитированному сообщению, и они обязаны совпадать.
+    # Если Telegram не указал тему цитаты, основной защитой остаётся сверка владельца карточки ниже.
+    if (original_message.message_thread_id is not None
+            and original_message.message_thread_id != message.message_thread_id):
+        logger.warning(
+            "Reply из темы %s на сообщение %s из темы %s — не доставляется",
+            message.message_thread_id, original_message.message_id, original_message.message_thread_id
+        )
+        await safe_answer(
+            message,
+            context=f'reply на сообщение из другой темы admin_id={message.from_user.id}',
+            text=REPLY_FOREIGN_CARD_TEXT
+        )
+        return
+
     user_id = await get_user_id(message.message_thread_id)
 
     if not user_id:
@@ -1626,40 +1652,37 @@ async def reply_to_message(message: types.Message, bot: Bot):
 
         return
 
-    client_appeal_text = await get_request_text_by_group_message_id(original_message.message_id)
+    # Обращение клиента — это ровно те сообщения бота, что записаны в Requests.group_message_id
+    # (карточки заявок и вопросов). Всё остальное от бота в теме (статусы диалога, уведомления,
+    # корень темы) — служебное, его текст клиенту не пересказываем.
+    reply_target = await get_reply_target_by_group_message_id(original_message.message_id)
 
-    if client_appeal_text is not None:
-        quoted_text = client_appeal_text
-
-        if len(quoted_text) > CLIENT_QUOTE_MAX_LENGTH:
-            quoted_text = quoted_text[:CLIENT_QUOTE_MAX_LENGTH] + '…'
-
-        context_text = f"📩 Ответ на ваше обращение «{html.escape(quoted_text)}»:"
-    else:
-        # Временный fallback: у обращений, созданных ДО появления Requests.group_message_id,
-        # это поле NULL, поэтому найти исходный текст клиента по id карточки в группе
-        # невозможно — откатываемся на старое поведение (разбор текста самой карточки).
-        # Как только такие "старые" обращения перестанут быть актуальными, эту ветку и
-        # проверку ниже можно будет убрать вместе с этим комментарием.
-        if not original_message.text:
-            await safe_answer(
-                message,
-                context=f'reply на нетекстовое сообщение бота admin_id={message.from_user.id}',
-                text='Сообщение, на которое вы ответили, не содержит текста. Чтобы ответ дошёл клиенту, '
-                     'используйте Reply на текстовое сообщение бота с заявкой или вопросом клиента.'
-            )
-            return
-
-        original_text = original_message.text
-
-        if len(original_text) > LEGACY_QUOTE_MAX_LENGTH:
-            original_text = original_text[:LEGACY_QUOTE_MAX_LENGTH] + '…'
-
-        context_text = (
-            f"📩 <b>Ответ администратора на ваше обращение:</b>\n"
-            f"<i>{html.escape(original_text)}</i>\n\n"
-            f"💬 <b>Сообщение администратора:</b>"
+    if reply_target is None:
+        await safe_answer(
+            message,
+            context=f'reply на служебное сообщение бота admin_id={message.from_user.id}',
+            text=REPLY_NOT_CLIENT_CARD_TEXT
         )
+        return
+
+    if reply_target.telegram_id != user_id:
+        logger.warning(
+            "Reply в теме %s (клиент user_id=%s) на карточку клиента user_id=%s — не доставляется",
+            message.message_thread_id, user_id, reply_target.telegram_id
+        )
+        await safe_answer(
+            message,
+            context=f'reply на карточку чужого клиента admin_id={message.from_user.id}',
+            text=REPLY_FOREIGN_CARD_TEXT
+        )
+        return
+
+    quoted_text = reply_target.text
+
+    if len(quoted_text) > CLIENT_QUOTE_MAX_LENGTH:
+        quoted_text = quoted_text[:CLIENT_QUOTE_MAX_LENGTH] + '…'
+
+    context_text = f"📩 Ответ на ваше обращение «{html.escape(quoted_text)}»:"
 
     try:
         await bot.send_message(chat_id=user_id, text=context_text)
@@ -2007,22 +2030,23 @@ def _newsletter_preview_text(newsletter: str, footer: str = '') -> str:
     footer_part = f'\n\n{footer}' if footer else ''
     escaped = html.escape(newsletter)
 
-    if len(NEWSLETTER_PREVIEW_HEADER) + len(escaped) + len(footer_part) <= TELEGRAM_MESSAGE_LIMIT:
+    if telegram_text_length(f'{NEWSLETTER_PREVIEW_HEADER}{escaped}{footer_part}') <= TELEGRAM_MESSAGE_LIMIT:
         return f'{NEWSLETTER_PREVIEW_HEADER}{escaped}{footer_part}'
 
-    budget = (TELEGRAM_MESSAGE_LIMIT - len(NEWSLETTER_PREVIEW_HEADER)
-              - len(NEWSLETTER_PREVIEW_TRUNCATED) - len(footer_part))
+    budget = TELEGRAM_MESSAGE_LIMIT - telegram_text_length(
+        f'{NEWSLETTER_PREVIEW_HEADER}{NEWSLETTER_PREVIEW_TRUNCATED}{footer_part}'
+    )
     pieces = []
     used = 0
 
     for char in newsletter:
         escaped_char = html.escape(char)
 
-        if used + len(escaped_char) > budget:
+        if used + telegram_text_length(escaped_char) > budget:
             break
 
         pieces.append(escaped_char)
-        used += len(escaped_char)
+        used += telegram_text_length(escaped_char)
 
     return f'{NEWSLETTER_PREVIEW_HEADER}{"".join(pieces)}{NEWSLETTER_PREVIEW_TRUNCATED}{footer_part}'
 
@@ -2240,4 +2264,24 @@ async def set_price_text(message: types.Message, state: FSMContext):
         context=f'успешное изменение прайса admin_id={message.from_user.id}',
         text='Прайс успешно изменён!',
         reply_markup=get_admin_keyboard()
+    )
+
+
+# Регистрируется последним: срабатывает, только если сообщение клиента вне формы/диалога не
+# подошло ни одной кнопке или команде выше. Ничего не сохраняет и никуда не пересылает.
+FREE_TEXT_HINT = (
+    '🙂 Я понимаю только кнопки меню.\n\n'
+    'Чтобы оставить заявку, задать вопрос или написать администратору — выберите нужный пункт ниже 👇'
+)
+
+
+@router.message(StateFilter(None),
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID)
+async def free_text_hint(message: types.Message):
+    await safe_answer(
+        message,
+        context=f'подсказка на сообщение вне меню user_id={message.from_user.id}',
+        text=FREE_TEXT_HINT,
+        reply_markup=get_main_keyboard()
     )

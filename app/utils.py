@@ -1,4 +1,6 @@
 import logging
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import (
     TelegramAPIError,
@@ -6,11 +8,19 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.types import Message
+from aiogram.types import Message, Update
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MESSAGE_LIMIT = 4096
+
+# Часовой пояс клиента Telegram боту не сообщает, поэтому все даты для клиента —
+# по Москве, с явной пометкой.
+CLIENT_TIMEZONE = ZoneInfo('Europe/Moscow')
+CLIENT_TIMEZONE_LABEL = 'МСК'
+
+UPDATE_ERROR_TEXT = '⚠️ Что-то пошло не так, попробуйте, пожалуйста, ещё раз.'
+UPDATE_ERROR_CALLBACK_TEXT = 'Произошла ошибка, попробуйте ещё раз'
 
 # Фрагменты текста ошибки Telegram, означающие ровно одно: темы, в которую бот
 # пытался написать, в группе больше нет (её удалили вручную). Это НЕ временный
@@ -43,9 +53,25 @@ def is_dead_topic_error(error: Exception) -> bool:
     return any(marker in text for marker in DEAD_TOPIC_ERROR_MARKERS)
 
 
+def telegram_text_length(text: str) -> int:
+    """
+    Длина text так, как её считает Telegram, — в единицах UTF-16. len() считает кодовые
+    точки, и любой символ вне BMP (эмодзи 😀 и т.п.) для Telegram вдвое длиннее.
+    """
+    return len(text.encode('utf-16-le')) // 2
+
+
 def exceeds_telegram_limit(text: str) -> int:
-    """Возвращает, на сколько символов text превышает лимит Telegram (0, если укладывается)."""
-    return max(0, len(text) - TELEGRAM_MESSAGE_LIMIT)
+    """Возвращает, на сколько символов (UTF-16) text превышает лимит Telegram (0, если укладывается)."""
+    return max(0, telegram_text_length(text) - TELEGRAM_MESSAGE_LIMIT)
+
+
+def format_client_date(value: datetime) -> str:
+    """Дата для сообщений клиенту: created_at (UTC) в московском времени с пометкой «(МСК)»."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return f"{value.astimezone(CLIENT_TIMEZONE).strftime('%d.%m.%Y')} ({CLIENT_TIMEZONE_LABEL})"
 
 
 def _log_send_failure(context: str, error: Exception) -> None:
@@ -136,3 +162,41 @@ async def safe_answer_callback(callback, *, context: str, **answer_kwargs) -> bo
     except TelegramAPIError as error:
         _log_send_failure(context, error)
         return False
+
+
+async def notify_update_error(bot, update: Update) -> None:
+    """
+    Общий ответ инициатору апдейта, хендлер которого упал необработанным исключением
+    (вызывается из dp.errors()), — чтобы вместо тишины пользователь понял, что нужно
+    повторить. На callback сначала отвечаем answerCallbackQuery, иначе кнопка «крутится»;
+    если хендлер успел ответить сам, повтор отклонит Telegram — safe_answer_callback это
+    проглотит, а сообщение в чат всё равно уйдёт. Сам никогда не бросает исключений.
+    """
+    try:
+        if update.message is not None or update.edited_message is not None:
+            message = update.message or update.edited_message
+            chat_id, thread_id = message.chat.id, message.message_thread_id
+        elif update.callback_query is not None:
+            callback = update.callback_query
+
+            await safe_answer_callback(
+                callback, context=f'ответ об ошибке на callback user_id={callback.from_user.id}',
+                text=UPDATE_ERROR_CALLBACK_TEXT, show_alert=True
+            )
+
+            if callback.message is not None:
+                chat_id = callback.message.chat.id
+                thread_id = getattr(callback.message, 'message_thread_id', None)
+            else:
+                chat_id, thread_id = callback.from_user.id, None
+        else:
+            return
+
+        await safe_send_message(
+            bot, chat_id,
+            context=f'общий ответ об ошибке апдейта {update.update_id} chat_id={chat_id}',
+            text=UPDATE_ERROR_TEXT,
+            message_thread_id=thread_id
+        )
+    except Exception:
+        logger.exception('Не удалось сообщить об ошибке инициатору апдейта %s', update.update_id)

@@ -1,7 +1,6 @@
 import asyncio
 import logging
 
-import aiohttp
 import sentry_sdk
 from sentry_sdk.integrations.asyncio import AsyncioIntegration
 from sentry_sdk.integrations.logging import ignore_logger
@@ -9,11 +8,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.types import ErrorEvent
 
 from config import Config
 from app.handlers import router
 from app.database import run_migrations, UnstampedDatabaseError
 from app.fsm_storage import PostgresStorage
+from app.background import cleanup_idle_fsm_locks, send_heartbeat
+from app.utils import notify_update_error
 
 
 logging.basicConfig(
@@ -42,9 +44,6 @@ if Config.SENTRY_DSN:
     logger.info('Sentry initialized')
 else:
     logger.info('SENTRY_DSN не задан — Sentry отключён')
-
-FSM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
-HEARTBEAT_TIMEOUT_SECONDS = 10
 
 
 bot = Bot(
@@ -96,77 +95,15 @@ dp.include_router(router)
 
 
 @dp.errors()
-async def on_error(event):
+async def on_error(event: ErrorEvent, bot: Bot):
     logger.error(
         'Необработанное исключение при обработке апдейта %s: %s',
         event.update.update_id,
         event.exception,
         exc_info=event.exception
     )
+    await notify_update_error(bot, event.update)
     return True
-
-
-async def cleanup_idle_fsm_locks(isolation: SimpleEventIsolation) -> None:
-    """
-    aiogram хранит блокировки диалогов (SimpleEventIsolation._locks) в
-    defaultdict, который растёт с каждым новым диалогом и никогда сам не
-    очищается (в исходниках aiogram на этот счёт прямо стоит комментарий
-    авторов: "TODO: Unused locks cleaner is needed"). Это утечка памяти при
-    долгой работе процесса без перезапуска.
-
-    Периодически удаляем locks, которые прямо сейчас никем не удерживаются
-    (между проверкой `not lock.locked()` и удалением ключа нет ни одного
-    `await`, поэтому в кооперативной модели asyncio интерливинг с новым
-    обращением к этому же ключу исключён).
-
-    Сами записи FSM живут в Postgres (PostgresStorage) и чистки не требуют:
-    пустая запись удаляется хранилищем сразу при state.clear().
-
-    `_locks` — приватная деталь реализации aiogram, а не публичный API,
-    поэтому обращение к нему обёрнуто в защитный try/except: если структура
-    изменится в новой версии aiogram, очистка просто перестанет работать (с
-    предупреждением в логах), а не уронит бота.
-    """
-    while True:
-        await asyncio.sleep(FSM_CLEANUP_INTERVAL_SECONDS)
-
-        try:
-            locks = isolation._locks
-            stale_lock_keys = [key for key, lock in locks.items() if not lock.locked()]
-
-            for key in stale_lock_keys:
-                del locks[key]
-        except AttributeError as error:
-            logger.warning('Очистка FSM-блокировок пропущена (несовместимая версия aiogram?): %s', error)
-            continue
-
-        logger.info(
-            'Периодическая очистка FSM-блокировок: удалено %s (осталось %s)',
-            len(stale_lock_keys), len(locks)
-        )
-
-
-async def send_heartbeat(url: str, interval_minutes: int) -> None:
-    """
-    Push-heartbeat во внешний dead-man's-switch (healthchecks.io / cronitor):
-    если пинги перестают приходить (процесс упал, завис цикл событий, контейнер
-    не поднялся), сервис сам алертит админа. Первый пинг — сразу при старте.
-
-    Любая ошибка пинга только логируется warning'ом: недоступность сервиса
-    мониторинга не должна влиять на работу бота.
-    """
-    timeout = aiohttp.ClientTimeout(total=HEARTBEAT_TIMEOUT_SECONDS)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            try:
-                async with session.get(url) as response:
-                    if response.status >= 400:
-                        logger.warning('Heartbeat: сервис ответил HTTP %s', response.status)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                logger.warning('Heartbeat не отправлен: %r', error)
-
-            await asyncio.sleep(interval_minutes * 60)
 
 
 async def main():

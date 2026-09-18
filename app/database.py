@@ -11,7 +11,8 @@ DATABASE_URL = Config.SQLALCHEMY_DATABASE_URI
 
 ALEMBIC_INI_PATH = Path(__file__).resolve().parent.parent / 'alembic.ini'
 
-engine = create_async_engine(url=DATABASE_URL)
+# pool_pre_ping: после рестарта БД первое обращение не получит из пула уже мёртвое соединение.
+engine = create_async_engine(url=DATABASE_URL, pool_pre_ping=True)
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 

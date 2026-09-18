@@ -81,13 +81,22 @@ async def save_user_appeal(user_id, message, appeal_type, name=None, birthday=No
         return True
 
 
-async def get_request_text_by_group_message_id(group_message_id):
-    query = select(Requests.text).where(Requests.group_message_id == group_message_id)
+async def get_reply_target_by_group_message_id(group_message_id):
+    """
+    Обращение клиента, чья карточка в группе имеет этот message_id: строка (text, telegram_id)
+    или None. None означает, что цитируемое сообщение бота — не карточка заявки/вопроса
+    (служебное сообщение, корень темы, карточка без сохранённого group_message_id).
+    """
+    query = (
+        select(Requests.text, Users.telegram_id)
+        .join(Users, Users.id == Requests.user_id)
+        .where(Requests.group_message_id == group_message_id)
+    )
 
     async with async_session_maker() as session:
         result = await session.execute(query)
 
-        return result.scalar_one_or_none()
+        return result.one_or_none()
 
 
 async def get_bid_history_by_thread_id(thread_id):
