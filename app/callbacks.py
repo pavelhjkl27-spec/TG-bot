@@ -30,6 +30,20 @@ class NewsletterCallback(CallbackData, prefix='newsletter'):
     draft_id: str
 
 
+class SettingsCallback(CallbackData, prefix='settings'):
+    """
+    Inline-кнопки под превью нового прайса / «О нас»: `settings:<action>:<target>:<draft_id>`.
+
+    action — 'save' | 'edit' | 'cancel'; target — 'price' | 'about'. draft_id совпадает с
+    data['draft_id'] в FSM админа (ChangePrice.confirm / ChangeAboutUs.confirm — по target):
+    любое решение атомарно стирает черновик, поэтому повторное, позднее или гоночное нажатие,
+    кнопки старых превью и превью другой цели ничего не делают. Как у NewsletterCallback.
+    """
+    action: str
+    target: str
+    draft_id: str
+
+
 class OrderStatusCallback(CallbackData, prefix='order'):
     """
     Inline-кнопки статуса под карточкой заявки в теме клиента: `order:<action>`.

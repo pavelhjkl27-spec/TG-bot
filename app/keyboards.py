@@ -1,6 +1,6 @@
 from aiogram import types
 
-from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback
+from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback, SettingsCallback
 
 
 def get_main_keyboard():
@@ -125,6 +125,28 @@ def get_newsletter_confirm_markup(draft_id: str):
             types.InlineKeyboardButton(
                 text='Отменить',
                 callback_data=NewsletterCallback(action='cancel', draft_id=draft_id).pack()
+            ),
+        ]
+    ])
+
+    return keyboard
+
+
+def get_settings_confirm_markup(target: str, draft_id: str):
+    """Кнопки под превью нового прайса / «О нас» (target — 'price' | 'about')."""
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(
+                text='Сохранить',
+                callback_data=SettingsCallback(action='save', target=target, draft_id=draft_id).pack()
+            ),
+            types.InlineKeyboardButton(
+                text='Изменить',
+                callback_data=SettingsCallback(action='edit', target=target, draft_id=draft_id).pack()
+            ),
+            types.InlineKeyboardButton(
+                text='Отменить',
+                callback_data=SettingsCallback(action='cancel', target=target, draft_id=draft_id).pack()
             ),
         ]
     ])

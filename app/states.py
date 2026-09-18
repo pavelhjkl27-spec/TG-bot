@@ -18,10 +18,12 @@ class Newsletter(StatesGroup):
 
 class ChangeAboutUs(StatesGroup):
     about_us_text = State()
+    confirm = State()
 
 
 class ChangePrice(StatesGroup):
     price = State()
+    confirm = State()
 
 
 class Dialog(StatesGroup):

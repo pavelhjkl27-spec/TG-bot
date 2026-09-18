@@ -1,4 +1,6 @@
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 import html
 import logging
@@ -8,18 +10,19 @@ from aiogram import Router, types, F, Bot
 from aiogram.enums import ContentType
 from aiogram.filters import CommandStart, Command, ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback
+from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback, SettingsCallback
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
                            get_admin_keyboard, get_newsletter_confirm_markup,
                            get_dialog_waiting_keyboard, get_dialog_active_keyboard,
                            get_dialog_request_markup, get_dialog_status_markup,
-                           get_order_status_markup)
+                           get_order_status_markup, get_settings_confirm_markup)
 from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice, Dialog
 from config import Config
 from app.db_requests import (add_user,
@@ -400,6 +403,28 @@ def render_welcome_text(price: str | None) -> str:
 
 def exceeds_welcome_limit(price: str) -> bool:
     return telegram_text_length(render_welcome_text(price)) > TELEGRAM_MESSAGE_LIMIT
+
+
+ABOUT_US_FALLBACK = 'Информация о нас пока не заполнена. Пожалуйста, задайте вопрос — мы ответим лично.'
+ABOUT_US_TOO_LONG_TEXT = (
+    '⚠️ Текст слишком длинный, раздел «О нас» не поместится в лимит Telegram — '
+    'сократите текст и отправьте заново.'
+)
+
+
+def render_about_us_text(about_us: str | None) -> str:
+    """
+    Единственная сборка раздела «О нас» так, как его видит клиент (кнопка «О нас»); ею же
+    строится превью при правке и проверка длины. about_us=None — описание не задано.
+    """
+    if about_us is None:
+        return ABOUT_US_FALLBACK
+
+    return f'ℹ️ <b>О нас</b>\n\n{html.escape(about_us)}'
+
+
+def exceeds_about_us_limit(about_us: str) -> bool:
+    return telegram_text_length(render_about_us_text(about_us)) > TELEGRAM_MESSAGE_LIMIT
 
 
 async def send_welcome_menu(message: types.Message, log_context: str) -> None:
@@ -1339,19 +1364,11 @@ async def about_us(message: types.Message):
 
     about_us_text = await get_about_us()
 
-    if about_us_text is None:
-        await safe_answer(
-            message,
-            context=f'отсутствие описания "О нас" user_id={user.id}',
-            text='Информация о нас пока не заполнена. Пожалуйста, задайте вопрос — мы ответим лично.'
-        )
-
-        return
-
     await safe_answer(
         message,
-        context=f'текст "О нас" user_id={user.id}',
-        text=f'ℹ️ <b>О нас</b>\n\n{html.escape(about_us_text)}'
+        context=(f'отсутствие описания "О нас" user_id={user.id}' if about_us_text is None
+                 else f'текст "О нас" user_id={user.id}'),
+        text=render_about_us_text(about_us_text)
     )
 
 
@@ -1401,13 +1418,7 @@ async def newsletter(message: types.Message, state: FSMContext):
                 F.from_user.id == Config.ADMIN_ID,
                 StateFilter(None))
 async def change_about_us(message: types.Message, state: FSMContext):
-    await state.set_state(ChangeAboutUs.about_us_text)
-
-    await safe_answer(
-        message,
-        context=f'запрос нового описания admin_id={message.from_user.id}',
-        text='Напишите новый текст раздела «О нас» — описание вашего сервиса и услуг:'
-    )
+    await _start_settings_edit(message, state, 'about')
 
 
 @router.message(F.text == 'Изменить прайс',
@@ -1415,13 +1426,7 @@ async def change_about_us(message: types.Message, state: FSMContext):
                 F.from_user.id == Config.ADMIN_ID,
                 StateFilter(None))
 async def change_price(message: types.Message, state: FSMContext):
-    await state.set_state(ChangePrice.price)
-
-    await safe_answer(
-        message,
-        context=f'запрос нового прайса admin_id={message.from_user.id}',
-        text='Напишите ваш прайс:'
-    )
+    await _start_settings_edit(message, state, 'price')
 
 
 @router.message(F.text == 'Как пользоваться ботом?',
@@ -1461,6 +1466,9 @@ async def admin_instruction(message: types.Message):
         '<b>3. Прайс и раздел «О нас»</b>\n'
         '• Кнопка «Изменить прайс» меняет прайс, который видят пользователи.\n'
         '• Кнопка Изменить «О нас» меняет описание сервиса.\n'
+        '• Бот сначала пришлёт текущий текст, а после ввода нового покажет, как его увидят клиенты. '
+        'Сохраняется только кнопкой «Сохранить» под превью.\n'
+        '• Передумали — нажмите «Меню» или «Отменить»: сохранённый текст не изменится.\n'
         '• Эти настройки хранятся в базе данных и не удаляются при обычном '
         'перезапуске самого бота.\n\n'
 
@@ -2257,106 +2265,390 @@ async def newsletter_cancel(callback: types.CallbackQuery, callback_data: Newsle
     )
 
 
+# ------------------------------------------------------------ Правка прайса и «О нас»
+#
+# Вход: текущее значение отдельным сообщением (как есть, экранированным — удобно скопировать),
+# затем приглашение и клавиатура «Меню». В состоянии ввода любой текст — новый вариант (тексты
+# админских кнопок не перехватываются), но в Settings он попадает только после превью «как увидит
+# клиент» и кнопки «Сохранить». Черновик и draft_id лежат в FSM-данных админа (PostgresStorage).
+# Решение по кнопке — атомарный transition_state из <цель>.confirm с этим draft_id, как у рассылки:
+# из повторных/гоночных нажатий любых кнопок эффект даёт ровно одно, кнопки старых превью и превью
+# другой цели не проходят проверку. «Меню» и /start в этих состояниях перехватывают menu/cmd_start
+# (зарегистрированы выше): state.clear() стирает черновик, поздние нажатия его превью — no-op.
+
+@dataclass(frozen=True)
+class _SettingsTarget:
+    input_state: State
+    confirm_state: State
+    get_current: Callable[[], Awaitable[str | None]]
+    render: Callable[[str], str]
+    too_long: Callable[[str], bool]
+    save: Callable[[str], Awaitable[bool]]
+    log_name: str
+    not_set_text: str
+    prompt_text: str
+    prompt_again_text: str
+    not_text_text: str
+    empty_text: str
+    too_long_text: str
+    preview_header: str
+    saved_text: str
+    cancelled_text: str
+    stale_on_save_text: str
+    save_failed_text: str
+
+
+# Функции берутся из модуля в момент вызова (lambda), а не при импорте: рендер всегда видит
+# актуальный шаблон, и повторная проверка при «Сохранить» считает тем же кодом, что и отправка.
+_SETTINGS_TARGETS = {
+    'price': _SettingsTarget(
+        input_state=ChangePrice.price,
+        confirm_state=ChangePrice.confirm,
+        get_current=lambda: get_price(),
+        render=lambda text: render_welcome_text(text),
+        too_long=lambda text: exceeds_welcome_limit(text),
+        save=lambda text: set_price(text),
+        log_name='прайс',
+        not_set_text=(
+            'Прайс ещё не задан — сейчас клиенты видят стандартный текст:\n\n'
+            f'«{html.escape(DEFAULT_PRICE_FALLBACK)}»'
+        ),
+        prompt_text=(
+            '✏️ Пришлите новый прайс целиком, одним сообщением. Перед сохранением я покажу, '
+            'как его увидят клиенты.\n\n'
+            'Чтобы выйти без изменений, нажмите «Меню».'
+        ),
+        prompt_again_text=(
+            '✏️ Выше — прежний вариант, его можно скопировать и поправить. Пришлите новый прайс '
+            'одним сообщением.\n\n'
+            'Чтобы выйти без изменений, нажмите «Меню».'
+        ),
+        not_text_text='⚠️ <i>Пожалуйста, отправьте прайс текстовым сообщением:</i>',
+        empty_text='⚠️ <i>Прайс не может быть пустым. Пожалуйста, отправьте текст прайса:</i>',
+        too_long_text=PRICE_TOO_LONG_TEXT,
+        preview_header='👇 Так клиенты увидят приветствие с новым прайсом. Сохранить?',
+        saved_text='✅ Прайс сохранён — клиенты уже видят новый.',
+        cancelled_text='Изменение прайса отменено, прайс остался прежним.',
+        stale_on_save_text=(
+            '⚠️ Прайс не сохранён: приветствие с ним больше не помещается в лимит Telegram. '
+            'Сократите текст и отправьте заново — прежний вариант ниже.'
+        ),
+        save_failed_text='⚠️ Прайс не удалось сохранить. Пожалуйста, попробуйте ещё раз — прежний вариант ниже.',
+    ),
+    'about': _SettingsTarget(
+        input_state=ChangeAboutUs.about_us_text,
+        confirm_state=ChangeAboutUs.confirm,
+        get_current=lambda: get_about_us(),
+        render=lambda text: render_about_us_text(text),
+        too_long=lambda text: exceeds_about_us_limit(text),
+        save=lambda text: set_about_us_text(text),
+        log_name='"О нас"',
+        not_set_text=(
+            'Раздел «О нас» ещё не заполнен — сейчас клиенты видят стандартный текст:\n\n'
+            f'«{html.escape(ABOUT_US_FALLBACK)}»'
+        ),
+        prompt_text=(
+            '✏️ Пришлите новый текст раздела «О нас» — описание вашего сервиса и услуг — целиком, '
+            'одним сообщением. Перед сохранением я покажу, как его увидят клиенты.\n\n'
+            'Чтобы выйти без изменений, нажмите «Меню».'
+        ),
+        prompt_again_text=(
+            '✏️ Выше — прежний вариант, его можно скопировать и поправить. Пришлите новый текст '
+            'раздела «О нас» одним сообщением.\n\n'
+            'Чтобы выйти без изменений, нажмите «Меню».'
+        ),
+        not_text_text='⚠️ <i>Пожалуйста, отправьте описание текстовым сообщением:</i>',
+        empty_text='⚠️ <i>Описание не может быть пустым. Пожалуйста, отправьте текст «О нас»:</i>',
+        too_long_text=ABOUT_US_TOO_LONG_TEXT,
+        preview_header='👇 Так клиенты увидят раздел «О нас». Сохранить?',
+        saved_text='✅ Текст «О нас» сохранён — клиенты уже видят новый.',
+        cancelled_text='Изменение «О нас» отменено, текст остался прежним.',
+        stale_on_save_text=(
+            '⚠️ Текст не сохранён: раздел «О нас» с ним больше не помещается в лимит Telegram. '
+            'Сократите текст и отправьте заново — прежний вариант ниже.'
+        ),
+        save_failed_text='⚠️ Текст не удалось сохранить. Пожалуйста, попробуйте ещё раз — прежний вариант ниже.',
+    ),
+}
+
+SETTINGS_STALE_TEXT = 'Это превью уже сохранено, изменено или отменено.'
+SETTINGS_CONFIRM_HINT = (
+    'Пожалуйста, воспользуйтесь кнопками «Сохранить», «Изменить» или «Отменить» под превью — '
+    'или нажмите «Меню», чтобы выйти без изменений.'
+)
+SETTINGS_CURRENT_UNAVAILABLE_TEXT = (
+    '⚠️ Текущий текст показать не удалось (он слишком длинный или Telegram вернул ошибку). '
+    'Можно просто прислать новый.'
+)
+SETTINGS_SAVED_FOOTER = '✅ Сохранено.'
+SETTINGS_NOT_SAVED_FOOTER = '⚠️ Не сохранено.'
+SETTINGS_EDIT_FOOTER = '✏️ Текст меняется.'
+SETTINGS_CANCEL_FOOTER = '❌ Изменение отменено.'
+
+
+async def _start_settings_edit(message: types.Message, state: FSMContext, target: str) -> None:
+    settings_target = _SETTINGS_TARGETS[target]
+    admin_id = message.from_user.id
+
+    # Состояние ввода — до показа текущего значения: что бы ни случилось с этим показом, админ
+    # остаётся в сценарии и получает приглашение ниже.
+    await state.set_state(settings_target.input_state)
+
+    # Сломанное значение (например, сохранённое до проверки длины) не должно запирать правку:
+    # именно тогда её и нужно сделать. Исключение не уходит в dp.errors(), чтобы админ не получил
+    # поверх приглашения общее «попробуйте ещё раз».
+    shown = False
+
+    try:
+        current = await settings_target.get_current()
+
+        if current is None:
+            shown = await safe_answer(message, context=f'текущий {settings_target.log_name} admin_id={admin_id}',
+                                      text=settings_target.not_set_text)
+        elif exceeds_telegram_limit(html.escape(current)):
+            logger.warning("Текущий %s не помещается в сообщение Telegram, не показан admin_id=%s",
+                           settings_target.log_name, admin_id)
+        else:
+            shown = await safe_answer(message, context=f'текущий {settings_target.log_name} admin_id={admin_id}',
+                                      text=html.escape(current))
+    except Exception:
+        logger.exception("Не удалось показать текущий %s admin_id=%s", settings_target.log_name, admin_id)
+
+    if not shown:
+        await safe_answer(message, context=f'текущий {settings_target.log_name} не показан admin_id={admin_id}',
+                          text=SETTINGS_CURRENT_UNAVAILABLE_TEXT)
+
+    await safe_answer(
+        message,
+        context=f'запрос нового текста {settings_target.log_name} admin_id={admin_id}',
+        text=settings_target.prompt_text,
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+async def _send_draft_for_rework(bot: Bot, admin_id: int, settings_target: _SettingsTarget, draft: str) -> None:
+    """Прежний черновик отдельным сообщением (чтобы скопировать и поправить), затем приглашение и «Меню»."""
+    await safe_send_message(
+        bot, admin_id,
+        context=f'прежний черновик {settings_target.log_name} admin_id={admin_id}',
+        text=html.escape(draft)
+    )
+    await safe_send_message(
+        bot, admin_id,
+        context=f'повторный запрос текста {settings_target.log_name} admin_id={admin_id}',
+        text=settings_target.prompt_again_text,
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+async def _accept_settings_draft(message: types.Message, state: FSMContext, target: str) -> None:
+    """Шаг ввода: проверки и превью. В Settings здесь не пишется ничего."""
+    settings_target = _SETTINGS_TARGETS[target]
+    admin_id = message.from_user.id
+
+    if not message.text:
+        await safe_answer(message, context=f'нераспознанный текст {settings_target.log_name} admin_id={admin_id}',
+                          text=settings_target.not_text_text)
+        return
+
+    if not message.text.strip():
+        await safe_answer(message, context=f'пустой текст {settings_target.log_name} admin_id={admin_id}',
+                          text=settings_target.empty_text)
+        return
+
+    # Клиенту текст уходит одним сообщением: если оно не влезет в лимит, его не получит никто.
+    # Проверяем тем же рендером, что и реальная отправка; состояние ввода не трогаем — админ
+    # сразу присылает новый вариант.
+    if settings_target.too_long(message.text):
+        await safe_answer(message, context=f'слишком длинный {settings_target.log_name} admin_id={admin_id}',
+                          text=settings_target.too_long_text)
+        return
+
+    draft_id = secrets.token_hex(4)
+
+    await state.update_data(draft=message.text, draft_id=draft_id)
+    await state.set_state(settings_target.confirm_state)
+
+    # Заголовок — отдельным сообщением: превью байт-в-байт совпадает с тем, что получит клиент,
+    # и текст ровно на пределе лимита тоже можно показать.
+    await safe_answer(message, context=f'заголовок превью {settings_target.log_name} admin_id={admin_id}',
+                      text=settings_target.preview_header)
+    await safe_answer(
+        message,
+        context=f'превью {settings_target.log_name} admin_id={admin_id}',
+        text=settings_target.render(message.text),
+        reply_markup=get_settings_confirm_markup(target, draft_id)
+    )
+
+
+async def _take_settings_draft(callback: types.CallbackQuery, callback_data: SettingsCallback,
+                               state: FSMContext, bot: Bot, *, to_input: bool) -> dict | None:
+    """
+    <цель>.confirm (с этим draft_id) → состояние ввода (to_input) или None, data стирается.
+    Победитель получает прежнюю data — черновик берётся только из неё. Проигравший (повтор, гонка,
+    старое превью, превью другой цели, неизвестная цель) — None, кнопки снимаются, на callback отвечено.
+    """
+    settings_target = _SETTINGS_TARGETS.get(callback_data.target)
+    old_data = None
+
+    if settings_target is not None:
+        old_data = await state.storage.transition_state(
+            state.key, from_state=settings_target.confirm_state, match={'draft_id': callback_data.draft_id},
+            to_state=settings_target.input_state if to_input else None, to_data={}
+        )
+
+    if old_data is None:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'неактуальное превью настроек admin_id={callback.from_user.id}',
+                                   text=SETTINGS_STALE_TEXT)
+        return None
+
+    return old_data
+
+
+async def _close_settings_preview(bot: Bot, callback: types.CallbackQuery, settings_target: _SettingsTarget,
+                                  draft: str, footer: str) -> None:
+    """Снимает кнопки с превью и дописывает итог; если с итогом превью не влезет в лимит — только снимает кнопки."""
+    if callback.message is None:
+        return
+
+    text = f'{settings_target.render(draft)}\n\n{footer}'
+
+    if telegram_text_length(text) > TELEGRAM_MESSAGE_LIMIT:
+        await _drop_stale_buttons(bot, callback)
+        return
+
+    await safe_edit_message_text(
+        bot, callback.message.chat.id, callback.message.message_id,
+        context=f'итог превью {settings_target.log_name} admin_id={callback.from_user.id}',
+        text=text
+    )
+
+
 @router.message(ChangeAboutUs.about_us_text,
                 F.chat.type == 'private',
                 F.from_user.id == Config.ADMIN_ID)
 async def set_about_us(message: types.Message, state: FSMContext):
-    if not message or not message.text:
-        await safe_answer(
-            message,
-            context=f'нераспознанный текст "О нас" admin_id={message.from_user.id}',
-            text='⚠️ <i>Пожалуйста, отправьте описание текстовым сообщением:</i>'
-        )
-
-        return
-
-    if not message.text.strip():
-        await safe_answer(
-            message,
-            context=f'пустой текст "О нас" admin_id={message.from_user.id}',
-            text='⚠️ <i>Описание не может быть пустым. Пожалуйста, отправьте текст «О нас»:</i>'
-        )
-
-        return
-
-    await state.update_data(about_us=message.text)
-    data = await state.get_data()
-
-    await state.clear()
-
-    status = await set_about_us_text(data['about_us'])
-
-    if not status:
-        await safe_answer(
-            message,
-            context=f'ошибка сохранения "О нас" admin_id={message.from_user.id}',
-            text='Текст не удалось сохранить. Пожалуйста, попробуйте ещё раз.'
-        )
-
-        return
-
-    await safe_answer(
-        message,
-        context=f'успешное изменение "О нас" admin_id={message.from_user.id}',
-        text='Текст успешно изменён!',
-        reply_markup=get_admin_keyboard()
-    )
+    await _accept_settings_draft(message, state, 'about')
 
 
 @router.message(ChangePrice.price,
                 F.chat.type == 'private',
                 F.from_user.id == Config.ADMIN_ID)
 async def set_price_text(message: types.Message, state: FSMContext):
-    if not message or not message.text:
-        await safe_answer(
-            message,
-            context=f'нераспознанный текст прайса admin_id={message.from_user.id}',
-            text='⚠️ <i>Пожалуйста, отправьте прайс текстовым сообщением:</i>'
-        )
+    await _accept_settings_draft(message, state, 'price')
 
-        return
 
-    if not message.text.strip():
-        await safe_answer(
-            message,
-            context=f'пустой прайс admin_id={message.from_user.id}',
-            text='⚠️ <i>Прайс не может быть пустым. Пожалуйста, отправьте текст прайса:</i>'
-        )
-
-        return
-
-    # Приветствие с прайсом уходит клиентам одним сообщением: если оно не влезет в лимит,
-    # его не получит никто. Проверяем тем же рендером, что и реальная отправка; состояние
-    # ChangePrice.price не трогаем — админ сразу присылает новый вариант.
-    if exceeds_welcome_limit(message.text):
-        await safe_answer(
-            message,
-            context=f'слишком длинный прайс admin_id={message.from_user.id}',
-            text=PRICE_TOO_LONG_TEXT
-        )
-
-        return
-
-    await state.update_data(price=message.text)
-    data = await state.get_data()
-
-    await state.clear()
-
-    status = await set_price(data['price'])
-
-    if not status:
-        await safe_answer(
-            message,
-            context=f'ошибка сохранения прайса admin_id={message.from_user.id}',
-            text='Прайс не удалось сохранить. Пожалуйста, попробуйте ещё раз.'
-        )
-
-        return
-
+@router.message(StateFilter(ChangePrice.confirm, ChangeAboutUs.confirm),
+                F.chat.type == 'private',
+                F.from_user.id == Config.ADMIN_ID)
+async def settings_confirm_hint(message: types.Message):
     await safe_answer(
         message,
-        context=f'успешное изменение прайса admin_id={message.from_user.id}',
-        text='Прайс успешно изменён!',
+        context=f'текст вместо кнопок превью настроек admin_id={message.from_user.id}',
+        text=SETTINGS_CONFIRM_HINT
+    )
+
+
+@router.callback_query(SettingsCallback.filter(), F.from_user.id != Config.ADMIN_ID)
+async def settings_callback_not_admin(callback: types.CallbackQuery):
+    await safe_answer_callback(
+        callback,
+        context=f'кнопка превью настроек не от админа user_id={callback.from_user.id}',
+        text='Эта кнопка доступна только администратору.', show_alert=True
+    )
+
+
+@router.callback_query(SettingsCallback.filter(F.action == 'save'), F.from_user.id == Config.ADMIN_ID)
+async def settings_save(callback: types.CallbackQuery, callback_data: SettingsCallback, state: FSMContext, bot: Bot):
+    admin_id = callback.from_user.id
+
+    data = await _take_settings_draft(callback, callback_data, state, bot, to_input=False)
+
+    if data is None:
+        return
+
+    settings_target = _SETTINGS_TARGETS[callback_data.target]
+    draft = data['draft']
+    saved = False
+
+    # Между превью и нажатием могло измениться то, во что текст вставляется (шаблон приветствия),
+    # поэтому лимит проверяется ещё раз тем же рендером.
+    if settings_target.too_long(draft):
+        reason = settings_target.stale_on_save_text
+    else:
+        reason = settings_target.save_failed_text
+
+        # Исключение ловим здесь, а не в dp.errors(): состояние уже снято переходом, и без
+        # восстановления ниже черновик пропал бы, а админ получил бы только общее «попробуйте ещё раз».
+        try:
+            saved = await settings_target.save(draft)
+        except Exception:
+            logger.exception("Не удалось сохранить %s admin_id=%s", settings_target.log_name, admin_id)
+
+    if saved:
+        await _close_settings_preview(bot, callback, settings_target, draft, SETTINGS_SAVED_FOOTER)
+        await safe_answer_callback(callback, context=f'сохранён {settings_target.log_name} admin_id={admin_id}',
+                                   text='Сохранено.')
+        await safe_send_message(
+            bot, admin_id,
+            context=f'успешное изменение {settings_target.log_name} admin_id={admin_id}',
+            text=settings_target.saved_text,
+            reply_markup=get_admin_keyboard()
+        )
+        return
+
+    # Не сохранено: возвращаем админа к вводу с тем же черновиком. Между переходом выше и этими
+    # строками состояние на мгновение пустое — в это окно ни одна кнопка превью уже не сработает
+    # (они ждут <цель>.confirm), а текст админа обработается как вне сценария.
+    await state.set_state(settings_target.input_state)
+    await state.update_data(draft=draft, draft_id=data['draft_id'])
+
+    await _close_settings_preview(bot, callback, settings_target, draft, SETTINGS_NOT_SAVED_FOOTER)
+    await safe_answer_callback(callback, context=f'не сохранён {settings_target.log_name} admin_id={admin_id}',
+                               text='Не сохранено.')
+    await safe_send_message(
+        bot, admin_id,
+        context=f'ошибка сохранения {settings_target.log_name} admin_id={admin_id}',
+        text=reason
+    )
+    await _send_draft_for_rework(bot, admin_id, settings_target, draft)
+
+
+@router.callback_query(SettingsCallback.filter(F.action == 'edit'), F.from_user.id == Config.ADMIN_ID)
+async def settings_edit(callback: types.CallbackQuery, callback_data: SettingsCallback, state: FSMContext, bot: Bot):
+    admin_id = callback.from_user.id
+
+    data = await _take_settings_draft(callback, callback_data, state, bot, to_input=True)
+
+    if data is None:
+        return
+
+    settings_target = _SETTINGS_TARGETS[callback_data.target]
+
+    await _close_settings_preview(bot, callback, settings_target, data['draft'], SETTINGS_EDIT_FOOTER)
+    await safe_answer_callback(callback, context=f'изменение черновика {settings_target.log_name} admin_id={admin_id}')
+    await _send_draft_for_rework(bot, admin_id, settings_target, data['draft'])
+
+
+@router.callback_query(SettingsCallback.filter(F.action == 'cancel'), F.from_user.id == Config.ADMIN_ID)
+async def settings_cancel(callback: types.CallbackQuery, callback_data: SettingsCallback, state: FSMContext, bot: Bot):
+    admin_id = callback.from_user.id
+
+    data = await _take_settings_draft(callback, callback_data, state, bot, to_input=False)
+
+    if data is None:
+        return
+
+    settings_target = _SETTINGS_TARGETS[callback_data.target]
+
+    await _close_settings_preview(bot, callback, settings_target, data['draft'], SETTINGS_CANCEL_FOOTER)
+    await safe_answer_callback(callback, context=f'отмена изменения {settings_target.log_name} admin_id={admin_id}',
+                               text='Изменение отменено.')
+    await safe_send_message(
+        bot, admin_id,
+        context=f'меню администратора после отмены изменения {settings_target.log_name} admin_id={admin_id}',
+        text=settings_target.cancelled_text,
         reply_markup=get_admin_keyboard()
     )
 
