@@ -1791,6 +1791,15 @@ async def set_birthday(message: types.Message, state: FSMContext):
 
         return
 
+    if not message.text.strip():
+        await safe_answer(
+            message,
+            context=f'пустое имя user_id={message.from_user.id}',
+            text="⚠️ <i>Имя не может быть пустым. Пожалуйста, введите ваше имя:</i>"
+        )
+
+        return
+
     if len(message.text) > NAME_MAX_LENGTH:
         await safe_answer(
             message,
@@ -1869,6 +1878,14 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
         )
         return
 
+    if not message.text.strip():
+        await safe_answer(
+            message,
+            context=f'пустой текст заявки user_id={message.from_user.id}',
+            text="⚠️ <i>Текст обращения не может быть пустым. Пожалуйста, опишите вашу заявку:</i>"
+        )
+        return
+
     await state.update_data(text=message.text)
     data = await state.get_data()
 
@@ -1933,6 +1950,14 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         )
         return
 
+    if not message.text.strip():
+        await safe_answer(
+            message,
+            context=f'пустой текст вопроса user_id={message.from_user.id}',
+            text='⚠️ Вопрос не может быть пустым. Пожалуйста, напишите ваш вопрос:'
+        )
+        return
+
     await state.update_data(question=message.text)
     data = await state.get_data()
 
@@ -1991,6 +2016,15 @@ async def send_newsletter(message: types.Message, state: FSMContext):
             message,
             context=f'нераспознанный текст рассылки admin_id={message.from_user.id}',
             text='Пожалуйста, отправьте текст рассылки текстовым сообщением.'
+        )
+
+        return
+
+    if not message.text.strip():
+        await safe_answer(
+            message,
+            context=f'пустой текст рассылки admin_id={message.from_user.id}',
+            text='⚠️ Текст рассылки не может быть пустым. Пожалуйста, отправьте текст рассылки.'
         )
 
         return
@@ -2236,6 +2270,15 @@ async def set_about_us(message: types.Message, state: FSMContext):
 
         return
 
+    if not message.text.strip():
+        await safe_answer(
+            message,
+            context=f'пустой текст "О нас" admin_id={message.from_user.id}',
+            text='⚠️ <i>Описание не может быть пустым. Пожалуйста, отправьте текст «О нас»:</i>'
+        )
+
+        return
+
     await state.update_data(about_us=message.text)
     data = await state.get_data()
 
@@ -2269,6 +2312,15 @@ async def set_price_text(message: types.Message, state: FSMContext):
             message,
             context=f'нераспознанный текст прайса admin_id={message.from_user.id}',
             text='⚠️ <i>Пожалуйста, отправьте прайс текстовым сообщением:</i>'
+        )
+
+        return
+
+    if not message.text.strip():
+        await safe_answer(
+            message,
+            context=f'пустой прайс admin_id={message.from_user.id}',
+            text='⚠️ <i>Прайс не может быть пустым. Пожалуйста, отправьте текст прайса:</i>'
         )
 
         return
