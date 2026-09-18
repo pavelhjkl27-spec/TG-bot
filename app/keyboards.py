@@ -10,7 +10,8 @@ def get_main_keyboard():
             types.KeyboardButton(text='Оставить заявку'),
         ],
         [
-            types.KeyboardButton(text='О нас')
+            types.KeyboardButton(text='О нас'),
+            types.KeyboardButton(text='Показать прайс'),
         ],
         [
             types.KeyboardButton(text='Запросить диалог с админом')

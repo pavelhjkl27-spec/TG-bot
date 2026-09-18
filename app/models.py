@@ -37,11 +37,16 @@ class Requests(Base):
     user = relationship('Users', back_populates='requests')
 
 
+# Значение price_text, пока прайс не задавали: его подставляет ORM, когда строку Settings создали
+# записью другого поля (/bind, «О нас»). Для клиента это то же самое, что «прайс не задан».
+DEFAULT_PRICE_TEXT = 'Прайс уточняется у администратора'
+
+
 class Settings(Base):
     __tablename__ = 'settings'
 
     id = Column(Integer, primary_key=True)
-    price_text = Column(Text, nullable=False, default='Прайс уточняется у администратора')
+    price_text = Column(Text, nullable=False, default=DEFAULT_PRICE_TEXT)
     about_us_text = Column(Text, nullable=False, default='Описание уточняется у администратора')
     group_id = Column(BigInteger, nullable=True, unique=True)
 

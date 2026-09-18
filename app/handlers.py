@@ -69,9 +69,9 @@ Users.topic_id из-за сбоя set_user_thread_id (даже после рет
 процесс бота жив, следующая попытка того же клиента переиспользует этот
 topic_id вместо создания ещё одной темы в группе — не более одной
 осиротевшей темы на клиента за инцидент, а не по одной на каждый повтор.
-Как и FSM-хранилка бота (тоже in-memory), это состояние не переживает
-перезапуск процесса — приемлемый компромисс, раз без похода в ту же самую
-недоступную сейчас БД персистентную альтернативу всё равно не сделать.
+В отличие от FSM-хранилища бота (оно в Postgres), это состояние живёт только в памяти
+и не переживает перезапуск процесса — приемлемый компромисс, раз без похода в ту же
+самую недоступную сейчас БД персистентную альтернативу всё равно не сделать.
 """
 
 
@@ -380,16 +380,35 @@ WELCOME_MENU_TEXT = (
 DEFAULT_PRICE_FALLBACK = 'Актуальные цены уточняются — напишите нам, и мы подскажем.'
 
 
-async def send_welcome_menu(message: types.Message, log_context: str) -> None:
-    price = await get_price()
+PRICE_TOO_LONG_TEXT = (
+    '⚠️ Текст слишком длинный, сообщение с прайсом не поместится в лимит Telegram — '
+    'сократите текст и отправьте заново.'
+)
 
+
+def render_welcome_text(price: str | None) -> str:
+    """
+    Единственная сборка текста «приветствие + прайс»: её используют отправка клиенту
+    (приветствие и «Показать прайс») и проверка длины при сохранении нового прайса.
+    price=None — прайс не задан, подставляется DEFAULT_PRICE_FALLBACK.
+    """
     if price is None:
         price = DEFAULT_PRICE_FALLBACK
+
+    return WELCOME_MENU_TEXT.format(price=html.escape(price))
+
+
+def exceeds_welcome_limit(price: str) -> bool:
+    return telegram_text_length(render_welcome_text(price)) > TELEGRAM_MESSAGE_LIMIT
+
+
+async def send_welcome_menu(message: types.Message, log_context: str) -> None:
+    price = await get_price()
 
     await safe_answer(
         message,
         context=f'{log_context} user_id={message.from_user.id}',
-        text=WELCOME_MENU_TEXT.format(price=html.escape(price)),
+        text=render_welcome_text(price),
         reply_markup=get_main_keyboard()
     )
 
@@ -1336,6 +1355,17 @@ async def about_us(message: types.Message):
     )
 
 
+# Как и остальные кнопки главного меню клиента — StateFilter(None) и регистрация выше
+# free_text_hint. Внутри форм/диалога главного меню на экране нет (там своя клавиатура),
+# а набранный вручную текст кнопки в форме — данные формы, как и у «О нас».
+@router.message(F.text == 'Показать прайс',
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID,
+                StateFilter(None))
+async def show_price(message: types.Message):
+    await send_welcome_menu(message, 'показ прайса')
+
+
 @router.message(F.text == 'Задать вопрос',
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID,
@@ -2239,6 +2269,18 @@ async def set_price_text(message: types.Message, state: FSMContext):
             message,
             context=f'нераспознанный текст прайса admin_id={message.from_user.id}',
             text='⚠️ <i>Пожалуйста, отправьте прайс текстовым сообщением:</i>'
+        )
+
+        return
+
+    # Приветствие с прайсом уходит клиентам одним сообщением: если оно не влезет в лимит,
+    # его не получит никто. Проверяем тем же рендером, что и реальная отправка; состояние
+    # ChangePrice.price не трогаем — админ сразу присылает новый вариант.
+    if exceeds_welcome_limit(message.text):
+        await safe_answer(
+            message,
+            context=f'слишком длинный прайс admin_id={message.from_user.id}',
+            text=PRICE_TOO_LONG_TEXT
         )
 
         return

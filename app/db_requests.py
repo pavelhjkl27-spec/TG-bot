@@ -1,4 +1,4 @@
-from app.models import Users, Settings, Requests
+from app.models import Users, Settings, Requests, DEFAULT_PRICE_TEXT
 from app.database import async_session_maker
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select, update
@@ -314,6 +314,11 @@ async def get_price():
         setting = result.scalar_one_or_none()
 
         if setting is None or setting.price_text is None:
+            return None
+
+        # Строку Settings мог создать не прайс (/bind, «О нас») — тогда в price_text лежит дефолт
+        # модели; для клиента это «не задан», как и пустой текст.
+        if not setting.price_text.strip() or setting.price_text == DEFAULT_PRICE_TEXT:
             return None
 
         return setting.price_text
