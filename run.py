@@ -14,7 +14,7 @@ from config import Config
 from app.handlers import router
 from app.database import run_migrations, UnstampedDatabaseError
 from app.fsm_storage import PostgresStorage
-from app.background import cleanup_idle_fsm_locks, send_heartbeat
+from app.background import cleanup_idle_fsm_locks, close_idle_dialogs_periodically, send_heartbeat
 from app.utils import notify_update_error
 
 
@@ -133,6 +133,7 @@ async def main():
     # Ссылка сохраняется на месте вызова: `dp.start_polling` ниже держит цикл
     # событий живым до остановки бота, так что задача не будет собрана GC раньше времени.
     cleanup_task = asyncio.create_task(cleanup_idle_fsm_locks(events_isolation))
+    dialog_timeout_task = asyncio.create_task(close_idle_dialogs_periodically(bot, dp.storage))
 
     if Config.HEARTBEAT_URL:
         heartbeat_task = asyncio.create_task(

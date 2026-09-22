@@ -11,12 +11,16 @@ import asyncio
 import logging
 
 import aiohttp
+from aiogram import Bot
 from aiogram.fsm.storage.memory import SimpleEventIsolation
+
+from app.handlers import close_idle_dialogs
 
 logger = logging.getLogger(__name__)
 
 FSM_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 HEARTBEAT_TIMEOUT_SECONDS = 10
+DIALOG_TIMEOUT_CHECK_INTERVAL_SECONDS = 5 * 60
 
 
 async def cleanup_idle_fsm_locks(isolation: SimpleEventIsolation,
@@ -90,3 +94,26 @@ async def send_heartbeat(url: str, interval_minutes: int) -> None:
                 logger.exception('Heartbeat: непредвиденная ошибка, повтор на следующей итерации')
 
             await asyncio.sleep(interval_minutes * 60)
+
+
+async def close_idle_dialogs_periodically(bot: Bot, storage,
+                                          interval_seconds: float = DIALOG_TIMEOUT_CHECK_INTERVAL_SECONDS) -> None:
+    """
+    Автозакрытие забытых запросов на диалог и активных диалогов (handlers.close_idle_dialogs:
+    сроки DIALOG_WAITING_TIMEOUT / DIALOG_ACTIVE_TIMEOUT, уведомление обеих сторон, атомарный
+    переход против параллельных действий клиента и админа). Первый проход — сразу при старте:
+    за время простоя бота что-то могло просрочиться.
+
+    Ошибка отдельного диалога изолирована внутри прохода; здесь ловится то, что уронило весь
+    проход (например, недоступная БД), — задача продолжает работу со следующей итерации.
+    """
+    while True:
+        try:
+            closed = await close_idle_dialogs(bot, storage)
+
+            if closed:
+                logger.info('Автозакрытие диалогов: закрыто %s', closed)
+        except Exception:
+            logger.exception('Автозакрытие диалогов: непредвиденная ошибка, повтор на следующей итерации')
+
+        await asyncio.sleep(interval_seconds)

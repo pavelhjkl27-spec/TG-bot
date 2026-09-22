@@ -1,7 +1,9 @@
-from app.models import Users, Settings, Requests, DEFAULT_PRICE_TEXT
+from datetime import timedelta
+
+from app.models import Users, Settings, Requests, FsmStorage, DEFAULT_PRICE_TEXT
 from app.database import async_session_maker
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 _SETTINGS_QUERY = select(Settings).where(Settings.id == 1)
 
@@ -240,6 +242,34 @@ async def clear_user_thread_id(user_id, topic_id):
         await session.commit()
 
         return cleared is not None
+
+
+async def get_idle_fsm_rows(bot_id: int, state: str, idle_for: timedelta) -> list[tuple[int, dict]]:
+    """
+    (user_id, data) личных FSM-записей в состоянии state, которые не менялись дольше idle_for
+    (fsm_storage.updated_at ставит каждая запись PostgresStorage). Самые старые — первыми.
+
+    Только чтение, без блокировок: это кандидаты. Решение о переходе принимает атомарный
+    PostgresStorage.transition_state, который перепроверит состояние и data под FOR UPDATE.
+    """
+    query = (
+        select(FsmStorage.user_id, FsmStorage.data)
+        .where(
+            FsmStorage.bot_id == bot_id,
+            FsmStorage.chat_id == FsmStorage.user_id,
+            FsmStorage.thread_id.is_(None),
+            FsmStorage.business_connection_id.is_(None),
+            FsmStorage.destiny == 'default',
+            FsmStorage.state == state,
+            FsmStorage.updated_at < func.now() - idle_for,
+        )
+        .order_by(FsmStorage.updated_at, FsmStorage.id)
+    )
+
+    async with async_session_maker() as session:
+        result = await session.execute(query)
+
+        return [(user_id, dict(data)) for user_id, data in result.all()]
 
 
 async def get_user_id(message_thread_id):

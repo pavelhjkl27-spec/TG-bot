@@ -1,7 +1,8 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from functools import partial
+from datetime import datetime, timedelta
 import html
 import logging
 import secrets
@@ -36,7 +37,8 @@ from app.db_requests import (add_user,
                              set_about_us_text, get_price,
                              set_price, get_reply_target_by_group_message_id,
                              get_bid_history_by_thread_id,
-                             transition_request_status, get_bid_card_by_group_message_id)
+                             transition_request_status, get_bid_card_by_group_message_id,
+                             get_idle_fsm_rows)
 from app.utils import (TELEGRAM_MESSAGE_LIMIT, exceeds_telegram_limit, is_dead_topic_error, safe_answer,
                        safe_send_message, send_message_capturing_error, safe_edit_message_text,
                        safe_answer_callback, telegram_text_length, format_client_date)
@@ -181,29 +183,38 @@ DEAD_TOPIC_ADMIN_NOTICE = (
     "Клиента уже попросили отправить обращение ещё раз, само обращение сейчас <b>не сохранено</b>.\n\n"
     "<i>Переписка из удалённой темы не восстанавливается.</i>"
 )
+DEAD_TOPIC_TIMEOUT_ADMIN_NOTICE = (
+    "⚠️ <b>Тема клиента недоступна</b>\n\n"
+    "{event}, но уведомление об этом в его тему не доставлено: темы в группе больше не существует — "
+    "скорее всего, её удалили вручную.\n\n"
+    "Привязка к удалённой теме сброшена: при следующем обращении клиента бот создаст ему новую тему. "
+    "Клиенту о закрытии бот сообщает в личке, как обычно.\n\n"
+    "<i>Переписка из удалённой темы не восстанавливается.</i>"
+)
 
 
-async def _heal_dead_topic(bot: Bot, user: types.User, topic_id: int) -> None:
+async def _heal_dead_topic(bot: Bot, client_id: int, topic_id: int, admin_notice: str) -> None:
     """
     Тема клиента есть в БД, но в Telegram её уже нет (удалили вручную). Без
     сброса привязки каждое следующее обращение этого клиента падало бы в ту же
     несуществующую тему — бесконечный цикл «не доставлено» без шанса
     самовосстановиться. Сбрасываем Users.topic_id (следующая попытка пойдёт
     штатным путём resolve_client_topic и создаст новую тему) и сообщаем админу,
-    чтобы он не узнал о поломке от клиента.
+    чтобы он не узнал о поломке от клиента. admin_notice — готовый текст этого
+    сообщения: у каждого вызывающего своя ситуация (DEAD_TOPIC_*_ADMIN_NOTICE).
     """
     logger.error(
         "Тема topic_id=%s клиента user_id=%s недоступна в Telegram (удалена?) — сбрасываем привязку, "
         "следующее обращение создаст новую тему",
-        topic_id, user.id
+        topic_id, client_id
     )
 
     try:
-        cleared = await clear_user_thread_id(user.id, topic_id)
+        cleared = await clear_user_thread_id(client_id, topic_id)
     except SQLAlchemyError as error:
         logger.error(
             "Не удалось сбросить topic_id=%s у user_id=%s после недоступной темы (ошибка БД): %s",
-            topic_id, user.id, error
+            topic_id, client_id, error
         )
         return
 
@@ -212,14 +223,14 @@ async def _heal_dead_topic(bot: Bot, user: types.User, topic_id: int) -> None:
         # второе уведомление админу о том же инциденте не нужно.
         logger.info(
             "topic_id=%s у user_id=%s к моменту сброса уже был изменён — уведомление админу не дублируем",
-            topic_id, user.id
+            topic_id, client_id
         )
         return
 
     await safe_send_message(
         bot, Config.ADMIN_ID,
-        context=f'уведомление админу о недоступной теме user_id={user.id} topic_id={topic_id}',
-        text=DEAD_TOPIC_ADMIN_NOTICE.format(client=html.escape(user.full_name), user_id=user.id)
+        context=f'уведомление админу о недоступной теме user_id={client_id} topic_id={topic_id}',
+        text=admin_notice
     )
 
 
@@ -269,7 +280,10 @@ async def _deliver_client_submission(
 
     if not delivered_message:
         if send_error is not None and is_dead_topic_error(send_error):
-            await _heal_dead_topic(bot, user, topic_id)
+            await _heal_dead_topic(
+                bot, user.id, topic_id,
+                DEAD_TOPIC_ADMIN_NOTICE.format(client=html.escape(user.full_name), user_id=user.id)
+            )
 
         await safe_answer(message, context=f'уведомление о недоставке user_id={user.id}', text=undelivered_text)
         return
@@ -452,6 +466,16 @@ async def send_welcome_menu(message: types.Message, log_context: str) -> None:
 # Клиентские хендлеры диалога зарегистрированы ДО cmd_start и menu: в диалоге /start —
 # это корректный выход с уведомлением админа, а любой другой текст (включая тексты кнопок
 # меню) — содержимое диалога, а не команда.
+#
+# Срок: ожидание и активный диалог закрываются фоновой задачей (close_idle_dialogs) после
+# DIALOG_*_TIMEOUT бездействия. «Давность» — fsm_storage.updated_at (его сдвигает любая запись
+# PostgresStorage), а каждое пересылаемое сообщение перед copy_to «касается» диалога
+# (_touch_dialog): меняет data['activity_id']. Автозакрытие требует в transition_state тот
+# activity_id, который видело при выборке, поэтому сообщение, успевшее коснуться диалога, не даст
+# закрыть его у себя за спиной, а опоздавшее не уйдёт после уведомления о закрытии.
+
+DIALOG_WAITING_TIMEOUT = timedelta(hours=4)
+DIALOG_ACTIVE_TIMEOUT = timedelta(hours=12)
 
 DIALOG_REQUEST_TEXT = (
     '💬 <b>Клиент запрашивает диалог</b>\n\n'
@@ -461,10 +485,41 @@ DIALOG_ACTIVE_TEXT = (
     '🟢 <b>Диалог активен</b>\n\n'
     'Пишите в эту тему — сообщения уходят клиенту напрямую. Сообщения клиента появятся здесь.'
 )
+DIALOG_WAITING_NOTE_TEXT = '✉️ Клиент пишет, пока ждёт подтверждения диалога:'
+DIALOG_WAITING_FORWARDED_TEXT = (
+    '✉️ Сообщение передано администратору. Запрос на диалог ждёт его решения — '
+    'если передумали, нажмите «Отменить запрос».'
+)
+DIALOG_WAITING_MENU_HINT_TEXT = (
+    '⏳ Ваш запрос на диалог ожидает решения администратора. '
+    'Чтобы оставить заявку или задать вопрос, сначала нажмите «Отменить запрос».'
+)
+DIALOG_REQUEST_ALREADY_CLOSED_TEXT = 'Запрос на диалог уже закрыт — сообщение не отправлено. Воспользуйтесь меню.'
+DIALOG_ALREADY_FINISHED_TEXT = 'Диалог уже завершён — сообщение не отправлено. Воспользуйтесь меню.'
+DIALOG_ALREADY_FINISHED_ADMIN_TEXT = 'Диалог уже завершён — сообщение клиенту не отправлено.'
+
+# Тексты кнопок главного меню клиента (и «Меню»), набранные в ожидании, — команды, а не
+# сообщения админу: их не пересылаем, а подсказываем сначала отменить запрос.
+CLIENT_MENU_TEXTS = frozenset(
+    {button.text for row in get_main_keyboard().keyboard for button in row} | {'Меню'}
+)
 
 
 def _client_key(bot: Bot, client_id: int) -> StorageKey:
     return StorageKey(bot_id=bot.id, chat_id=client_id, user_id=client_id)
+
+
+async def _touch_dialog(bot: Bot, storage, client_id: int, dialog_id: str) -> bool:
+    """
+    Отметка активности диалога перед пересылкой сообщения: новый activity_id (и свежий updated_at).
+    False — диалога dialog_id уже нет (закрыт любым способом), пересылать нельзя. update_data_if не
+    воскрешает удалённую запись; из-за FOR UPDATE в transition_state касание и автозакрытие
+    сериализуются по строке — побеждает ровно одно.
+    """
+    return await storage.update_data_if(
+        _client_key(bot, client_id),
+        match={'dialog_id': dialog_id}, patch={'activity_id': secrets.token_hex(4)}
+    )
 
 
 async def _notify_client(bot: Bot, client_id: int, *, context: str, **send_kwargs) -> bool:
@@ -495,9 +550,9 @@ async def _drop_stale_buttons(bot: Bot, callback: types.CallbackQuery) -> None:
         logger.info("Не удалось снять устаревшие кнопки message_id=%s: %s", callback.message.message_id, error)
 
 
-async def _close_dialog_request(bot: Bot, storage, client_id: int, dialog_id: str, *, by_admin: bool) -> bool:
+async def _close_dialog_request(bot: Bot, storage, client_id: int, dialog_id: str, *, closed_by: str) -> bool:
     """
-    Dialog.waiting → None: отклонение админом (by_admin=True) или отмена клиентом.
+    Dialog.waiting → None: отклонение админом (closed_by='admin') или отмена клиентом ('client').
     Возвращает False, если переход уже сделала другая сторона — тогда ничего не шлёт.
     """
     old_data = await storage.transition_state(
@@ -508,19 +563,41 @@ async def _close_dialog_request(bot: Bot, storage, client_id: int, dialog_id: st
     if old_data is None:
         return False
 
+    await _announce_request_closed(bot, client_id, old_data, closed_by=closed_by)
+
+    return True
+
+
+async def _announce_request_closed(bot: Bot, client_id: int, old_data: dict, *, closed_by: str) -> None:
+    """
+    Уведомления о закрытом запросе на диалог (переход waiting → None уже сделан вызывающим).
+    closed_by: 'admin' | 'client' | 'timeout' (автозакрытие, см. close_idle_dialogs).
+    """
     group_id = await get_group_id()
     topic_id = await get_user_thread_id(client_id)
     request_message_id = old_data.get('request_message_id')
 
-    if by_admin:
-        request_result_text = '❌ Запрос отклонён администратором.'
-        client_text = (
+    # (итог на карточке запроса, уведомление в тему или None, ответ клиенту)
+    request_result_text, topic_text, client_text = {
+        'admin': (
+            '❌ Запрос отклонён администратором.',
+            None,
             'К сожалению, сейчас администратор не может начать диалог. '
-            'Вы можете задать вопрос или оставить заявку — мы обязательно ответим.'
-        )
-    else:
-        request_result_text = '❌ Клиент отменил запрос на диалог.'
-        client_text = 'Запрос на диалог отменён.'
+            'Вы можете задать вопрос или оставить заявку — мы обязательно ответим.',
+        ),
+        'client': (
+            '❌ Клиент отменил запрос на диалог.',
+            '❌ Клиент отменил запрос на диалог.',
+            'Запрос на диалог отменён.',
+        ),
+        'timeout': (
+            '⌛️ Запрос закрыт автоматически — не было ответа.',
+            '⌛️ Запрос клиента на диалог закрыт автоматически: его долго не подтверждали. '
+            'Клиент может запросить диалог заново.',
+            '⌛️ Запрос на диалог закрыт: администратор так и не смог ответить. '
+            'Вы можете задать вопрос или оставить заявку — мы обязательно ответим, — или запросить диалог заново.',
+        ),
+    }[closed_by]
 
     if group_id is not None and request_message_id is not None:
         await safe_edit_message_text(
@@ -529,12 +606,16 @@ async def _close_dialog_request(bot: Bot, storage, client_id: int, dialog_id: st
             text=f'{DIALOG_REQUEST_TEXT}\n\n{request_result_text}'
         )
 
-    if not by_admin and group_id is not None and topic_id is not None:
-        await safe_send_message(
-            bot, group_id,
-            context=f'уведомление об отмене запроса на диалог user_id={client_id}',
-            text=request_result_text, message_thread_id=topic_id
-        )
+    if topic_text is not None and group_id is not None and topic_id is not None:
+        context = f'уведомление о закрытии запроса на диалог ({closed_by}) user_id={client_id}'
+
+        if closed_by == 'timeout':
+            await _send_timeout_topic_notice(
+                bot, group_id, client_id, topic_id, topic_text, context=context,
+                event='Запрос на диалог клиента {client} закрыт автоматически по неактивности'
+            )
+        else:
+            await safe_send_message(bot, group_id, context=context, text=topic_text, message_thread_id=topic_id)
 
     await _notify_client(
         bot, client_id,
@@ -542,15 +623,12 @@ async def _close_dialog_request(bot: Bot, storage, client_id: int, dialog_id: st
         text=client_text, reply_markup=get_main_keyboard()
     )
 
-    return True
-
 
 async def _finish_active_dialog(bot: Bot, storage, client_id: int, dialog_id: str, *, ended_by: str) -> bool:
     """
     Dialog.active → None. ended_by: 'client' | 'admin' | 'blocked' (бот заблокирован
-    клиентом — выяснилось при пересылке). Статус-сообщение в теме в любом случае
-    теряет кнопку «Завершить»; вторая сторона получает явное уведомление. Возвращает
-    False (и ничего не шлёт), если диалог уже завершила другая сторона.
+    клиентом — выяснилось при пересылке). Возвращает False (и ничего не шлёт), если
+    диалог уже завершила другая сторона.
     """
     old_data = await storage.transition_state(
         _client_key(bot, client_id),
@@ -560,6 +638,18 @@ async def _finish_active_dialog(bot: Bot, storage, client_id: int, dialog_id: st
     if old_data is None:
         return False
 
+    await _announce_dialog_finished(bot, client_id, old_data, ended_by=ended_by)
+
+    return True
+
+
+async def _announce_dialog_finished(bot: Bot, client_id: int, old_data: dict, *, ended_by: str) -> None:
+    """
+    Уведомления о завершённом диалоге (переход active → None уже сделан вызывающим).
+    ended_by: 'client' | 'admin' | 'blocked' | 'timeout' (автозакрытие, см. close_idle_dialogs).
+    Статус-сообщение в теме в любом случае теряет кнопку «Завершить»; вторая сторона
+    (при таймауте — обе) получает явное уведомление.
+    """
     group_id = await get_group_id()
     topic_id = await get_user_thread_id(client_id)
     status_message_id = old_data.get('status_message_id')
@@ -568,6 +658,7 @@ async def _finish_active_dialog(bot: Bot, storage, client_id: int, dialog_id: st
         'client': '🔴 <b>Диалог завершён клиентом</b>',
         'admin': '🔴 <b>Диалог завершён администратором</b>',
         'blocked': '🔴 <b>Диалог завершён</b>: клиент заблокировал бота',
+        'timeout': '🔴 <b>Диалог завершён</b>: долго не было сообщений',
     }
 
     if group_id is not None and status_message_id is not None:
@@ -586,19 +677,24 @@ async def _finish_active_dialog(bot: Bot, storage, client_id: int, dialog_id: st
             reply_markup=get_main_keyboard()
         )
 
-        return True
+        return
 
     if group_id is not None and topic_id is not None:
-        topic_text = (
-            '🔴 Клиент вышел из диалога. Сообщения в этой теме больше не пересылаются клиенту.'
-            if ended_by == 'client' else
-            '🔴 Клиент заблокировал бота — сообщение не доставлено, диалог завершён.'
-        )
-        await safe_send_message(
-            bot, group_id,
-            context=f'уведомление о завершении диалога ({ended_by}) user_id={client_id}',
-            text=topic_text, message_thread_id=topic_id
-        )
+        topic_text = {
+            'client': '🔴 Клиент вышел из диалога. Сообщения в этой теме больше не пересылаются клиенту.',
+            'blocked': '🔴 Клиент заблокировал бота — сообщение не доставлено, диалог завершён.',
+            'timeout': '🔴 Диалог завершён автоматически — долго не было сообщений. '
+                       'Сообщения в этой теме больше не пересылаются клиенту.',
+        }[ended_by]
+        context = f'уведомление о завершении диалога ({ended_by}) user_id={client_id}'
+
+        if ended_by == 'timeout':
+            await _send_timeout_topic_notice(
+                bot, group_id, client_id, topic_id, topic_text, context=context,
+                event='Диалог с клиентом {client} завершён автоматически по неактивности'
+            )
+        else:
+            await safe_send_message(bot, group_id, context=context, text=topic_text, message_thread_id=topic_id)
 
     if ended_by == 'client':
         await _notify_client(
@@ -607,8 +703,89 @@ async def _finish_active_dialog(bot: Bot, storage, client_id: int, dialog_id: st
             text='Вы вышли из диалога с администратором.',
             reply_markup=get_main_keyboard()
         )
+    elif ended_by == 'timeout':
+        await _notify_client(
+            bot, client_id,
+            context='автозавершение диалога',
+            text='🔴 Диалог с администратором завершён — долго не было сообщений. Спасибо за общение!\n\n'
+                 'Если появятся вопросы — воспользуйтесь меню.',
+            reply_markup=get_main_keyboard()
+        )
 
-    return True
+
+async def _send_timeout_topic_notice(bot: Bot, group_id: int, client_id: int, topic_id: int, text: str, *,
+                                     context: str, event: str) -> None:
+    """
+    Уведомление в тему об автозакрытии. Если темы в Telegram больше нет, самолечение как в
+    _deliver_client_submission: привязка сбрасывается, админ узнаёт о проблеме в личке, а не
+    только из лога. event — что случилось, с плейсхолдером {client}.
+    """
+    sent, error = await send_message_capturing_error(
+        bot, group_id, context=context, text=text, message_thread_id=topic_id
+    )
+
+    if sent is None and error is not None and is_dead_topic_error(error):
+        client = f'<b>{html.escape(await get_topic_name(client_id) or "")}</b> (id <code>{client_id}</code>)'
+        await _heal_dead_topic(
+            bot, client_id, topic_id, DEAD_TOPIC_TIMEOUT_ADMIN_NOTICE.format(event=event.format(client=client))
+        )
+
+
+async def close_idle_dialogs(bot: Bot, storage) -> int:
+    """
+    Один проход автозакрытия (его крутит background.close_idle_dialogs_periodically):
+    Dialog.waiting без активности дольше DIALOG_WAITING_TIMEOUT и Dialog.active — дольше
+    DIALOG_ACTIVE_TIMEOUT закрываются с уведомлением обеих сторон. Возвращает число закрытых.
+
+    Выборка кандидатов — без блокировок; решает transition_state (здесь же, а не в
+    _close_dialog_request/_finish_active_dialog) с match по dialog_id и activity_id, которые
+    кандидат имел при выборке. Если за это время диалог подтвердили,
+    отклонили, отменили, завершили или в нём появилось сообщение (_touch_dialog сменил
+    activity_id), переход не совпадёт и кандидат молча пропускается. Записи без activity_id
+    (созданные до автозакрытия) сверяются только по dialog_id.
+
+    Переход делается до отправок (at-most-once, как рассылка и статус заказа): неудачное
+    уведомление не откатывает закрытие и не повторяется на следующем проходе, а закрытие всё
+    равно учитывается в возвращаемом числе. Ошибка по одному кандидату логируется и не мешает
+    остальным.
+    """
+    closed = 0
+
+    for state, timeout, announce in (
+        (Dialog.waiting, DIALOG_WAITING_TIMEOUT, partial(_announce_request_closed, closed_by='timeout')),
+        (Dialog.active, DIALOG_ACTIVE_TIMEOUT, partial(_announce_dialog_finished, ended_by='timeout')),
+    ):
+        for client_id, data in await get_idle_fsm_rows(bot.id, state.state, timeout):
+            dialog_id = data.get('dialog_id')
+
+            if dialog_id is None:
+                continue
+
+            match = {'dialog_id': dialog_id}
+
+            if 'activity_id' in data:
+                match['activity_id'] = data['activity_id']
+
+            try:
+                old_data = await storage.transition_state(
+                    _client_key(bot, client_id), from_state=state, match=match, to_state=None, to_data={}
+                )
+            except Exception:
+                logger.exception('Автозакрытие диалога user_id=%s (%s): переход не удался', client_id, state.state)
+                continue
+
+            if old_data is None:
+                continue
+
+            # Считаем по переходу: диалог закрыт, даже если какое-то уведомление ниже не дойдёт.
+            closed += 1
+
+            try:
+                await announce(bot, client_id, old_data)
+            except Exception:
+                logger.exception('Автозакрытие диалога user_id=%s (%s): уведомления не отправлены', client_id, state.state)
+
+    return closed
 
 
 async def _leave_dialog_by_client(message: types.Message, state: FSMContext, bot: Bot) -> bool:
@@ -626,18 +803,20 @@ async def _leave_dialog_by_client(message: types.Message, state: FSMContext, bot
         return True
 
     if current_state == Dialog.active.state:
-        # Проигрыш перехода здесь означает, что диалог уже завершил админ и сам уведомил клиента.
+        # Проигрыш перехода здесь означает, что диалог уже завершил админ или автозакрытие — победитель
+        # сам уведомил клиента («Администратор завершил» / «завершён — долго не было сообщений»), а
+        # «Вы вышли» клиент не получит, чтобы не решить, что это он завершил диалог.
         await _finish_active_dialog(bot, state.storage, client_id, dialog_id, ended_by='client')
         return True
 
     if current_state != Dialog.waiting.state:
         return True
 
-    if await _close_dialog_request(bot, state.storage, client_id, dialog_id, by_admin=False):
+    if await _close_dialog_request(bot, state.storage, client_id, dialog_id, closed_by='client'):
         return True
 
-    # Отмена проиграла переход. Из waiting выходят только в None (отклонение — клиент уже
-    # получил ответ) или в active (подтверждение); назад в waiting состояние не возвращается,
+    # Отмена проиграла переход. Из waiting выходят только в None (отклонение или автозакрытие —
+    # клиент уже получил ответ) или в active (подтверждение); назад в waiting состояние не возвращается,
     # поэтому перечитать его после проигрыша безопасно.
     if (await state.get_state() != Dialog.active.state
             or (await state.get_data()).get('dialog_id') != dialog_id):
@@ -687,8 +866,10 @@ async def request_dialog(message: types.Message, state: FSMContext, bot: Bot):
 
     # Состояние ставится ДО отправки кнопок в группу: иначе админ мог бы нажать
     # «Подтвердить» раньше, чем появится запись, и получить «запрос неактуален».
+    # activity_id — с самого начала: автозакрытие сверяет его в transition_state, а `@>` не заметил
+    # бы, что касание лишь добавило ключ, которого при выборке кандидата ещё не было.
     await state.set_state(Dialog.waiting)
-    await state.set_data({'dialog_id': dialog_id})
+    await state.set_data({'dialog_id': dialog_id, 'activity_id': secrets.token_hex(4)})
 
     request_message = await safe_send_message(
         bot, group_id,
@@ -716,7 +897,9 @@ async def request_dialog(message: types.Message, state: FSMContext, bot: Bot):
         message,
         context=f'подтверждение запроса на диалог user_id={user.id}',
         text='📨 <b>Запрос отправлен</b>\n\n'
-             'Как только администратор подключится, вы получите уведомление и сможете переписываться напрямую.',
+             'Как только администратор подключится, вы получите уведомление и сможете переписываться напрямую.\n\n'
+             'Пока ждёте, можете написать суть вопроса — сообщение передадим администратору. '
+             'Если передумали — нажмите «Отменить запрос», и тогда можно будет оставить заявку или задать вопрос.',
         reply_markup=get_dialog_waiting_keyboard()
     )
 
@@ -741,44 +924,117 @@ async def leave_dialog(message: types.Message, state: FSMContext, bot: Bot):
 
 
 @router.message(Dialog.waiting,
+                F.text.in_(CLIENT_MENU_TEXTS),
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID)
-async def dialog_waiting_hint(message: types.Message):
+async def dialog_waiting_menu_hint(message: types.Message):
     await safe_answer(
         message,
         context=f'подсказка ожидания диалога user_id={message.from_user.id}',
-        text='⏳ Ваш запрос на диалог ожидает решения администратора. '
-             'Если передумали — нажмите «Отменить запрос».',
+        text=DIALOG_WAITING_MENU_HINT_TEXT,
         reply_markup=get_dialog_waiting_keyboard()
+    )
+
+
+async def _copy_client_message_to_topic(message: types.Message, group_id: int, topic_id: int) -> bool:
+    """copy_to сообщения клиента в его тему; при сбое — ответ клиенту о недоставке."""
+    try:
+        await message.copy_to(chat_id=group_id, message_thread_id=topic_id)
+        return True
+    except TelegramAPIError as error:
+        logger.warning("Пересылка сообщения клиента user_id=%s в тему topic_id=%s не удалась: %s",
+                       message.from_user.id, topic_id, error)
+        await safe_answer(
+            message,
+            context=f'сообщение диалога не доставлено user_id={message.from_user.id}',
+            text='Сообщение не доставлено администратору. Попробуйте отправить его ещё раз чуть позже.'
+        )
+        return False
+
+
+async def _client_dialog_topic(message: types.Message) -> tuple[int, int] | None:
+    """(group_id, topic_id) для пересылки в диалоге; без группы/темы — ответ клиенту и None."""
+    user = message.from_user
+    group_id = await get_group_id()
+    topic_id = await get_user_thread_id(user.id)
+
+    if group_id is None or topic_id is None:
+        logger.error("Диалог без группы/темы: user_id=%s group_id=%s topic_id=%s", user.id, group_id, topic_id)
+        await safe_answer(
+            message,
+            context=f'диалог без темы user_id={user.id}',
+            text='Сообщение не доставлено: бот временно не работает. Попробуйте позже.'
+        )
+        return None
+
+    return group_id, topic_id
+
+
+@router.message(Dialog.waiting,
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID)
+async def forward_client_waiting_message(message: types.Message, state: FSMContext, bot: Bot):
+    # Раньше здесь была только подсказка «ожидает решения», и текст клиента пропадал.
+    user = message.from_user
+    dialog_id = (await state.get_data()).get('dialog_id')
+    target = await _client_dialog_topic(message)
+
+    if target is None:
+        return
+
+    group_id, topic_id = target
+
+    # Касание — до пересылки: либо автозакрытие уже прошло (не пересылаем, говорим клиенту),
+    # либо после касания оно не пройдёт, пока сообщение уходит в тему.
+    if dialog_id is None or not await _touch_dialog(bot, state.storage, user.id, dialog_id):
+        await safe_answer(
+            message,
+            context=f'сообщение после закрытия запроса на диалог user_id={user.id}',
+            text=DIALOG_REQUEST_ALREADY_CLOSED_TEXT, reply_markup=get_main_keyboard()
+        )
+        return
+
+    await safe_send_message(
+        bot, group_id,
+        context=f'пометка сообщения в ожидании диалога user_id={user.id}',
+        text=DIALOG_WAITING_NOTE_TEXT, message_thread_id=topic_id
+    )
+
+    if not await _copy_client_message_to_topic(message, group_id, topic_id):
+        return
+
+    # Без reply_markup: если админ как раз подтвердил диалог, не затираем клавиатуру «Выйти из диалога».
+    await safe_answer(
+        message,
+        context=f'сообщение в ожидании диалога передано user_id={user.id}',
+        text=DIALOG_WAITING_FORWARDED_TEXT
     )
 
 
 @router.message(Dialog.active,
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID)
-async def forward_client_dialog_message(message: types.Message, bot: Bot):
+async def forward_client_dialog_message(message: types.Message, state: FSMContext, bot: Bot):
     user = message.from_user
-    group_id = await get_group_id()
-    topic_id = await get_user_thread_id(user.id)
+    dialog_id = (await state.get_data()).get('dialog_id')
+    target = await _client_dialog_topic(message)
 
-    if group_id is None or topic_id is None:
-        logger.error("Активный диалог без группы/темы: user_id=%s group_id=%s topic_id=%s", user.id, group_id, topic_id)
+    if target is None:
+        return
+
+    group_id, topic_id = target
+
+    # Касание — до пересылки (см. forward_client_waiting_message): сообщение не уйдёт в тему
+    # после уведомления об автозавершении.
+    if dialog_id is None or not await _touch_dialog(bot, state.storage, user.id, dialog_id):
         await safe_answer(
             message,
-            context=f'диалог без темы user_id={user.id}',
-            text='Сообщение не доставлено: бот временно не работает. Попробуйте позже.'
+            context=f'сообщение после завершения диалога user_id={user.id}',
+            text=DIALOG_ALREADY_FINISHED_TEXT, reply_markup=get_main_keyboard()
         )
         return
 
-    try:
-        await message.copy_to(chat_id=group_id, message_thread_id=topic_id)
-    except TelegramAPIError as error:
-        logger.warning("Пересылка сообщения клиента user_id=%s в тему topic_id=%s не удалась: %s", user.id, topic_id, error)
-        await safe_answer(
-            message,
-            context=f'сообщение диалога не доставлено user_id={user.id}',
-            text='Сообщение не доставлено администратору. Попробуйте отправить его ещё раз чуть позже.'
-        )
+    await _copy_client_message_to_topic(message, group_id, topic_id)
 
 
 @router.callback_query(DialogCallback.filter(), F.from_user.id != Config.ADMIN_ID)
@@ -835,12 +1091,12 @@ async def dialog_confirm(callback: types.CallbackQuery, callback_data: DialogCal
     )
 
     if old_data is None:
-        # Клиент успел отменить запрос (или /start) между предпроверкой и переходом —
-        # он уже получил «Запрос отменён», а тема — уведомление об отмене.
+        # Запрос закрыли между предпроверкой и переходом: клиент отменил его (или /start) либо
+        # сработало автозакрытие. Победитель уже уведомил клиента и тему — причина видна там.
         await safe_edit_message_text(
             bot, group_id, status_message.message_id,
             context=f'статус неначатого диалога user_id={client_id}',
-            text='⚪️ <b>Диалог не начат</b>: клиент отменил запрос'
+            text='⚪️ <b>Диалог не начат</b>: запрос уже закрыт'
         )
         await reject_stale()
         return
@@ -894,7 +1150,7 @@ async def dialog_confirm(callback: types.CallbackQuery, callback_data: DialogCal
 @router.callback_query(DialogCallback.filter(F.action == 'reject'), F.from_user.id == Config.ADMIN_ID)
 async def dialog_reject(callback: types.CallbackQuery, callback_data: DialogCallback, bot: Bot, fsm_storage):
     closed = await _close_dialog_request(
-        bot, fsm_storage, callback_data.client_id, callback_data.dialog_id, by_admin=True
+        bot, fsm_storage, callback_data.client_id, callback_data.dialog_id, closed_by='admin'
     )
 
     if not closed:
@@ -1602,6 +1858,15 @@ async def active_dialog_in_topic(message: types.Message, bot: Bot, fsm_storage) 
                 active_dialog_in_topic)
 async def forward_admin_dialog_message(message: types.Message, bot: Bot, fsm_storage,
                                        client_id: int, dialog_id: str):
+    # Касание — до пересылки, как у клиента: заметка админа не уйдёт клиенту после «диалог завершён».
+    if not await _touch_dialog(bot, fsm_storage, client_id, dialog_id):
+        await safe_answer(
+            message,
+            context=f'сообщение админа после завершения диалога user_id={client_id}',
+            text=DIALOG_ALREADY_FINISHED_ADMIN_TEXT
+        )
+        return
+
     try:
         await message.copy_to(chat_id=client_id)
     except TelegramForbiddenError as error:
