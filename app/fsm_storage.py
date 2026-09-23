@@ -1,11 +1,11 @@
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 
 from aiogram.exceptions import DataNotDictLikeError
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import BaseStorage, StateType, StorageKey
-from sqlalchemy import and_, delete, func, literal, select, update
-from sqlalchemy.dialects.postgresql import JSONB, insert
+from sqlalchemy import Text, and_, delete, func, literal, select, update
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert
 
 from app.database import async_session_maker
 from app.models import FsmStorage
@@ -203,6 +203,45 @@ class PostgresStorage(BaseStorage):
             await session.commit()
 
         return updated
+
+    async def update_data_if_no_state(self, key: StorageKey, patch: Mapping[str, Any]) -> bool:
+        """
+        Поверхностный merge patch в data, только если state сейчас None (строки нет — создаётся с
+        state NULL). Одним upsert'ом с условием в DO UPDATE: запись в форме/диалоге не трогается
+        вообще (ни data, ни updated_at). True — записано.
+        """
+        async with self._session_maker() as session:
+            stmt = insert(FsmStorage).values(**_key_values(key), data=dict(patch))
+            stmt = stmt.on_conflict_do_update(
+                constraint=KEY_CONSTRAINT,
+                set_={
+                    'data': FsmStorage.data.op('||', return_type=JSONB)(stmt.excluded.data),
+                    'updated_at': func.now(),
+                },
+                where=FsmStorage.state.is_(None),
+            ).returning(FsmStorage.id)
+
+            result = await session.execute(stmt)
+            updated = result.scalar_one_or_none() is not None
+            await session.commit()
+
+        return updated
+
+    async def patch_data(self, key: StorageKey, *, remove: Collection[str] = (),
+                         merge: Mapping[str, Any] | None = None) -> None:
+        """
+        Одним UPDATE удаляет из data ключи remove и мержит merge (`(data - keys) || merge`).
+        Строку не создаёт; опустевшая строка без состояния удаляется, как после set_data({}).
+        """
+        async with self._session_maker() as session:
+            await session.execute(
+                update(FsmStorage).where(_key_filter(key))
+                .values(data=FsmStorage.data.op('-', return_type=JSONB)(literal(list(remove), ARRAY(Text)))
+                        .op('||', return_type=JSONB)(literal(dict(merge or {}), JSONB)),
+                        updated_at=func.now())
+            )
+            await self._delete_if_empty(session, key)
+            await session.commit()
 
     @staticmethod
     async def _delete_if_empty(session, key: StorageKey) -> None:

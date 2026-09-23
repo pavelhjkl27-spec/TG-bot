@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import html
 import logging
 import secrets
@@ -191,6 +191,9 @@ DEAD_TOPIC_TIMEOUT_ADMIN_NOTICE = (
     "Клиенту о закрытии бот сообщает в личке, как обычно.\n\n"
     "<i>Переписка из удалённой темы не восстанавливается.</i>"
 )
+ATTACHMENT_UNDELIVERED_CARD_NOTE = (
+    '⚠️ Вложение не доставлено — обращение не сохранено, клиента попросили отправить его ещё раз.'
+)
 
 
 async def _heal_dead_topic(bot: Bot, client_id: int, topic_id: int, admin_notice: str) -> None:
@@ -252,12 +255,15 @@ async def _deliver_client_submission(
     name: str | None = None,
     birthday: str | None = None,
     reply_markup: types.InlineKeyboardMarkup | None = None,
+    attachment: types.Message | None = None,
 ) -> None:
     """
     Общий хвост отправки заявки/вопроса: резолвит (или создаёт) тему клиента,
     шлёт итоговый текст в группу, сохраняет обращение в БД и подтверждает
     клиенту. Используется и save_statement, и save_question, чтобы у обоих
     сценариев было гарантированно одинаковое поведение при любых сбоях.
+    attachment — сообщение клиента с вложением (фото/документ вопроса): копируется
+    в тему ответом на карточку; не дошло — обращение не сохраняется, как при недоставке карточки.
     """
     try:
         topic_id = await resolve_client_topic(bot, user, group_id)
@@ -287,6 +293,26 @@ async def _deliver_client_submission(
 
         await safe_answer(message, context=f'уведомление о недоставке user_id={user.id}', text=undelivered_text)
         return
+
+    if attachment is not None:
+        try:
+            await attachment.copy_to(
+                chat_id=group_id, message_thread_id=topic_id,
+                reply_parameters=types.ReplyParameters(message_id=delivered_message.message_id)
+            )
+        except TelegramAPIError as error:
+            logger.warning(
+                "Вложение обращения (type=%s) user_id=%s не скопировано в тему topic_id=%s: %s",
+                appeal_type, user.id, topic_id, error
+            )
+            # Карточка уже в теме, но без вложения и без записи в БД — помечаем, чтобы админ не отвечал на неё.
+            await safe_edit_message_text(
+                bot, group_id, delivered_message.message_id,
+                context=f'пометка карточки без вложения user_id={user.id}',
+                text=f'{final_text}\n\n{ATTACHMENT_UNDELIVERED_CARD_NOTE}'
+            )
+            await safe_answer(message, context=f'вложение не доставлено user_id={user.id}', text=undelivered_text)
+            return
 
     result = None
     save_error = None
@@ -840,6 +866,10 @@ async def _leave_dialog_by_client(message: types.Message, state: FSMContext, bot
                 StateFilter(None))
 async def request_dialog(message: types.Message, state: FSMContext, bot: Bot):
     user = message.from_user
+
+    # До ранних выходов ниже: при успехе set_data всё равно заменит данные, а при отказе клиент
+    # остаётся в главном меню — и окно ответа уже закрыто его явным действием.
+    await _close_reply_window(state)
 
     group_id = await get_group_id()
 
@@ -1598,6 +1628,7 @@ async def bot_removed_from_group(event: types.ChatMemberUpdated, bot: Bot):
                 F.from_user.id != Config.ADMIN_ID,
                 StateFilter(None))
 async def set_name(message: types.Message, state: FSMContext):
+    await _close_reply_window(state)
     await state.set_state(Form.name)
 
     await safe_answer(
@@ -1614,11 +1645,13 @@ async def set_name(message: types.Message, state: FSMContext):
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID,
                 StateFilter(None))
-async def about_us(message: types.Message):
+async def about_us(message: types.Message, state: FSMContext):
     user = message.from_user
 
     if user is None:
         return
+
+    await _close_reply_window(state)
 
     about_us_text = await get_about_us()
 
@@ -1637,7 +1670,8 @@ async def about_us(message: types.Message):
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID,
                 StateFilter(None))
-async def show_price(message: types.Message):
+async def show_price(message: types.Message, state: FSMContext):
+    await _close_reply_window(state)
     await send_welcome_menu(message, 'показ прайса')
 
 
@@ -1646,6 +1680,7 @@ async def show_price(message: types.Message):
                 F.from_user.id != Config.ADMIN_ID,
                 StateFilter(None))
 async def question_text(message: types.Message, state: FSMContext):
+    await _close_reply_window(state)
     await state.set_state(Question.question)
 
     await safe_answer(
@@ -1895,7 +1930,7 @@ REPLY_FOREIGN_CARD_TEXT = (
 @router.message(F.reply_to_message,
                 F.from_user.id == Config.ADMIN_ID,
                 F.message_thread_id.is_not(None))
-async def reply_to_message(message: types.Message, bot: Bot):
+async def reply_to_message(message: types.Message, bot: Bot, fsm_storage):
     group_id = await get_group_id()
 
     if group_id is None:
@@ -2051,6 +2086,8 @@ async def reply_to_message(message: types.Message, bot: Bot):
             context=f'подпись к содержимому без caption user_id={user_id}',
             text=followup_caption
         )
+
+    await _open_reply_window(bot, fsm_storage, user_id)
 
 
 @router.message(Form.name,
@@ -2217,15 +2254,25 @@ async def save_statement(message: types.Message, state: FSMContext, bot: Bot):
                 F.chat.type == 'private',
                 F.from_user.id != Config.ADMIN_ID)
 async def save_question(message: types.Message, state: FSMContext, bot: Bot):
-    if not message or not message.text:
+    attachment = None
+
+    if message.photo or message.document:
+        # Вопрос-вложение (фото чека, скриншот, файл): в Requests.text — пометка вида вложения и подпись.
+        attachment = message
+        kind = '[фото]' if message.photo else '[документ]'
+        caption = (message.caption or '').strip()
+        question = f'{kind} {caption}' if caption else kind
+    elif message.text:
+        question = message.text
+    else:
         await safe_answer(
             message,
             context=f'нераспознанный текст вопроса user_id={message.from_user.id}',
-            text='Пожалуйста, отправьте вопрос текстовым сообщением.'
+            text='Пожалуйста, отправьте вопрос текстом, фото или документом.'
         )
         return
 
-    if not message.text.strip():
+    if not question.strip():
         await safe_answer(
             message,
             context=f'пустой текст вопроса user_id={message.from_user.id}',
@@ -2233,7 +2280,7 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
         )
         return
 
-    await state.update_data(question=message.text)
+    await state.update_data(question=question)
     data = await state.get_data()
 
     final_text = f'Новый вопрос!\n\n{html.escape(data["question"])}'
@@ -2269,7 +2316,7 @@ async def save_question(message: types.Message, state: FSMContext, bot: Bot):
     await _deliver_client_submission(
         message, state, bot,
         user=user, group_id=group_id, final_text=final_text,
-        appeal_type='Question', save_text=message.text,
+        appeal_type='Question', save_text=question, attachment=attachment,
         telegram_error_text='К сожалению, сейчас не получилось отправить вопрос. Пожалуйста, попробуйте ещё раз чуть позже.',
         db_error_text='Не получилось обработать ваш вопрос. Пожалуйста, отправьте его ещё раз через несколько минут.',
         not_registered_text='Вы ещё не зарегистрированы в боте. Пожалуйста, напишите /start, чтобы начать.',
@@ -2920,8 +2967,132 @@ async def settings_cancel(callback: types.CallbackQuery, callback_data: Settings
     )
 
 
+# ------------------------------------------------------------ Окно ответа клиента
+#
+# После успешного Reply админа на карточку (reply_to_message) клиент может просто ответить
+# сообщением — оно уйдёт в его тему, а не упрётся в free_text_hint. Нового состояния FSM и фоновой
+# задачи нет: в data клиента (только при state None) лежат ISO-метки UTC, сравниваемые с now()
+# в момент прихода сообщения:
+#   awaiting_reply_since — последний ответ админа; ждёт первого сообщения клиента до REPLY_AWAITING_TTL;
+#   reply_window_until   — после пересылки: ещё REPLY_WINDOW на дополнения, каждая пересылка
+#                          пересчитывает его от текущего момента.
+# Окно открыто, если действует хотя бы одна метка: так повторный ответ админа при ещё активном окне
+# не теряется, когда окно истечёт. Протухшие метки не удаляются, просто не срабатывают; явное
+# действие клиента (кнопка главного меню, «Меню», /start) их стирает.
+#
+# Хендлер стоит прямо перед free_text_hint: формы, диалог, кнопки и команды обрабатываются раньше
+# и в приоритете (плюс StateFilter(None)).
+
+REPLY_AWAITING_TTL = timedelta(days=7)
+REPLY_WINDOW = timedelta(minutes=10)
+REPLY_WINDOW_KEYS = ('awaiting_reply_since', 'reply_window_until')
+
+CLIENT_REPLY_NOTE_TEXT = '↩️ Ответ клиента:'
+CLIENT_REPLY_FORWARDED_TEXT = (
+    '✅ Передали администратору. Если нужно добавить что-то ещё — можно написать в течение ближайших 10 минут.'
+)
+CLIENT_REPLY_FORWARDED_AGAIN_TEXT = '✅ Передали и это. Дописать можно ещё в течение 10 минут.'
+
+
+def _parse_reply_mark(value) -> datetime | None:
+    """ISO-метка окна ответа; битое, нестроковое или без часового пояса значение — как отсутствующее."""
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _reply_window_status(data: dict, now: datetime) -> str | None:
+    """'window' — идёт окно дополнений, 'awaiting' — ждём первого ответа клиента, None — окно закрыто."""
+    until = _parse_reply_mark(data.get('reply_window_until'))
+
+    if until is not None and now < until:
+        return 'window'
+
+    since = _parse_reply_mark(data.get('awaiting_reply_since'))
+
+    if since is not None and now - since < REPLY_AWAITING_TTL:
+        return 'awaiting'
+
+    return None
+
+
+async def _open_reply_window(bot: Bot, storage, client_id: int) -> None:
+    """
+    Отметка «клиенту есть на что ответить» после доставленного ответа админа. В форме/диалоге не
+    ставится (update_data_if_no_state): там сообщения клиента обрабатывает своё состояние, а его выход
+    всё равно стёр бы данные. Сбой БД только логируется — ответ уже у клиента, повтор был бы дублем.
+    """
+    try:
+        await storage.update_data_if_no_state(
+            _client_key(bot, client_id),
+            {'awaiting_reply_since': datetime.now(timezone.utc).isoformat()}
+        )
+    except SQLAlchemyError as error:
+        logger.error("Не удалось открыть окно ответа user_id=%s (ошибка БД): %s", client_id, error)
+
+
+async def _close_reply_window(state: FSMContext) -> None:
+    """Явное действие клиента в главном меню закрывает окно ответа досрочно."""
+    await state.storage.patch_data(state.key, remove=REPLY_WINDOW_KEYS)
+
+
+async def reply_window_open(message: types.Message, state: FSMContext) -> dict | bool:
+    """Фильтр: у клиента открыто окно ответа. Передаёт в хендлер reply_continues (идёт окно дополнений)."""
+    status = _reply_window_status(await state.get_data(), datetime.now(timezone.utc))
+
+    if status is None:
+        return False
+
+    return {'reply_continues': status == 'window'}
+
+
+@router.message(StateFilter(None),
+                F.chat.type == 'private',
+                F.from_user.id != Config.ADMIN_ID,
+                reply_window_open)
+async def forward_client_reply(message: types.Message, state: FSMContext, bot: Bot, reply_continues: bool):
+    user = message.from_user
+    target = await _client_dialog_topic(message)
+
+    if target is None:
+        return
+
+    group_id, topic_id = target
+
+    await safe_send_message(
+        bot, group_id,
+        context=f'пометка ответа клиента user_id={user.id}',
+        text=CLIENT_REPLY_NOTE_TEXT, message_thread_id=topic_id
+    )
+
+    if not await _copy_client_message_to_topic(message, group_id, topic_id):
+        return
+
+    # Пересчёт от текущего момента, а не сумма: серия быстрых сообщений не обрывается посередине.
+    # Сбой записи не откатывает пересылку: остаётся прежняя метка, и окно живёт по ней.
+    try:
+        await state.storage.patch_data(
+            state.key, remove=['awaiting_reply_since'],
+            merge={'reply_window_until': (datetime.now(timezone.utc) + REPLY_WINDOW).isoformat()}
+        )
+    except SQLAlchemyError as error:
+        logger.error("Ответ клиента user_id=%s переслан, но окно ответа не обновлено (ошибка БД): %s", user.id, error)
+
+    await safe_answer(
+        message,
+        context=f'ответ клиента передан user_id={user.id}',
+        text=CLIENT_REPLY_FORWARDED_AGAIN_TEXT if reply_continues else CLIENT_REPLY_FORWARDED_TEXT
+    )
+
+
 # Регистрируется последним: срабатывает, только если сообщение клиента вне формы/диалога не
-# подошло ни одной кнопке или команде выше. Ничего не сохраняет и никуда не пересылает.
+# подошло ни одной кнопке или команде выше и окно ответа закрыто. Ничего не сохраняет и никуда не пересылает.
 FREE_TEXT_HINT = (
     '🙂 Я понимаю только кнопки меню.\n\n'
     'Чтобы оставить заявку, задать вопрос или написать администратору — выберите нужный пункт ниже 👇'
