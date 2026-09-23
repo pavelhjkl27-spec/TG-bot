@@ -48,10 +48,26 @@ class OrderStatusCallback(CallbackData, prefix='order'):
     """
     Inline-кнопки статуса под карточкой заявки в теме клиента: `order:<action>`.
 
-    action — 'accept' (new → in_progress) или 'done' (in_progress → done). Заявка определяется не по
-    callback_data, а по самой карточке: callback.message.message_id == Requests.group_message_id
-    (карточка уходит в группу раньше, чем появляется строка Requests). Переход — атомарный условный
-    UPDATE на requests (не FSM): повторное, позднее или гоночное нажатие не совпадёт по ожидаемому
-    статусу и ничего не изменит.
+    action — 'accept' (new → in_progress); 'done' («Готово», статус не меняет: в in_progress заменяет
+    кнопку на подтверждение); 'confirm' (подтверждение «Готово», in_progress → done) и 'cancel'
+    (возврат кнопки текущего статуса). Заявка определяется не по callback_data, а по самой карточке:
+    callback.message.message_id == Requests.group_message_id (карточка уходит в группу раньше, чем
+    появляется строка Requests). Переход — атомарный условный UPDATE на requests (не FSM): повторное,
+    позднее или гоночное нажатие не совпадёт по ожидаемому статусу и ничего не изменит.
     """
     action: str
+
+
+class ReadyCallback(CallbackData, prefix='ready'):
+    """
+    Кнопки вопроса «Это готовый разбор?» под документом админа: `ready:<action>:<card_id>:<copy_id>`.
+
+    action — 'yes' | 'no'. card_id — карточка заявки в группе (== Requests.group_message_id), copy_id —
+    копия документа в чате клиента: уведомление «разбор готов» уходит ответом на неё. Всё нужное лежит
+    в самой кнопке, поэтому вопрос не зависит от FSM и памяти процесса и переживает рестарт. «Да» —
+    тот же атомарный условный UPDATE, что у OrderStatusCallback (new | in_progress → done): повторное,
+    гоночное или позднее нажатие (заявка уже done) ничего не изменит и клиента не уведомит.
+    """
+    action: str
+    card_id: int
+    copy_id: int

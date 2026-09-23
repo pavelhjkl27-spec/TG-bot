@@ -16,14 +16,15 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback, SettingsCallback
+from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback, ReadyCallback, SettingsCallback
 from app.keyboards import (get_main_keyboard,
                            get_cancel_keyboard,
                            get_back_cancel_keyboard,
                            get_admin_keyboard, get_newsletter_confirm_markup,
                            get_dialog_waiting_keyboard, get_dialog_active_keyboard,
                            get_dialog_request_markup, get_dialog_status_markup,
-                           get_order_status_markup, get_settings_confirm_markup)
+                           get_order_status_markup, get_order_done_confirm_markup,
+                           get_ready_question_markup, get_settings_confirm_markup)
 from app.states import Form, Question, Newsletter, ChangeAboutUs, ChangePrice, Dialog
 from config import Config
 from app.db_requests import (add_user,
@@ -64,7 +65,7 @@ CAPTION_CAPABLE_CONTENT_TYPES = {
     ContentType.DOCUMENT, ContentType.PHOTO, ContentType.VIDEO,
     ContentType.AUDIO, ContentType.VOICE, ContentType.ANIMATION,
 }
-DOCUMENT_FALLBACK_CAPTION = 'Ваш разбор готов, файл прикреплён ниже 📎'
+FILE_FALLBACK_CAPTION = '📎 Файл от администратора'
 NEUTRAL_FALLBACK_CAPTION = 'Сообщение от администратора'
 
 _pending_topic_ids: dict[int, int] = {}
@@ -378,12 +379,13 @@ ORDER_STATUS_LABELS = {
 }
 
 
-def _bid_card_text(name: str, birthday: str, text: str, status: str | None = None) -> str:
+def _bid_card_text(name: str, birthday: str, text: str, status: str | None = None, hint: str | None = None) -> str:
     """
-    Карточка заявки в теме клиента. Без status (или со status='new') — ровно тот текст, что
-    уходит при подаче заявки. Для in_progress/done добавляется строка статуса; если с ней карточка
-    перестаёт влезать в лимит Telegram (текст заявки проверен на лимит без неё), обрезается только
-    показ текста клиента — по исходным символам, чтобы не разорвать HTML-сущность.
+    Карточка заявки в теме клиента. Без status (или со status='new') и без hint — ровно тот текст, что
+    уходит при подаче заявки. Для in_progress/done добавляется строка статуса, а hint (подсказка на время
+    подтверждения «Готово») — абзацем в конце; если с ними карточка перестаёт влезать в лимит Telegram
+    (текст заявки проверен на лимит без них), обрезается только показ текста клиента — по исходным
+    символам, чтобы не разорвать HTML-сущность.
     """
     prefix = (
         f"{BID_CARD_HEADER}"
@@ -393,13 +395,14 @@ def _bid_card_text(name: str, birthday: str, text: str, status: str | None = Non
     )
     status_part = '' if status in (None, 'new') \
         else f"\n\n📌 <b>Статус:</b> {ORDER_STATUS_LABELS.get(status, status)}"
+    suffix = status_part + (f"\n\n{hint}" if hint else '')
     escaped = html.escape(text)
 
-    # Без строки статуса текст не обрезается: save_statement проверяет лимит именно на нём.
-    if not status_part or telegram_text_length(f"{prefix}<i>{escaped}</i>{status_part}") <= TELEGRAM_MESSAGE_LIMIT:
-        return f"{prefix}<i>{escaped}</i>{status_part}"
+    # Без строки статуса и подсказки текст не обрезается: save_statement проверяет лимит именно на нём.
+    if not suffix or telegram_text_length(f"{prefix}<i>{escaped}</i>{suffix}") <= TELEGRAM_MESSAGE_LIMIT:
+        return f"{prefix}<i>{escaped}</i>{suffix}"
 
-    budget = TELEGRAM_MESSAGE_LIMIT - telegram_text_length(f"{prefix}<i>{BID_CARD_TRUNCATED}</i>{status_part}")
+    budget = TELEGRAM_MESSAGE_LIMIT - telegram_text_length(f"{prefix}<i>{BID_CARD_TRUNCATED}</i>{suffix}")
     pieces = []
     used = 0
 
@@ -412,7 +415,7 @@ def _bid_card_text(name: str, birthday: str, text: str, status: str | None = Non
         pieces.append(escaped_char)
         used += telegram_text_length(escaped_char)
 
-    return f"{prefix}<i>{''.join(pieces)}{BID_CARD_TRUNCATED}</i>{status_part}"
+    return f"{prefix}<i>{''.join(pieces)}{BID_CARD_TRUNCATED}</i>{suffix}"
 
 
 WELCOME_MENU_TEXT = (
@@ -1415,14 +1418,17 @@ async def client_history(message: types.Message):
 
 # ------------------------------------------------------------ Статус заказа
 #
-# Кнопки под карточкой заявки (Bid) в теме клиента: «Принято в работу» (new → in_progress) и
-# «Готово» (in_progress → done). Статус — поле Requests.status, не FSM: переход — атомарный условный
-# UPDATE на requests (transition_request_status). Заявка ищется по самой карточке
-# (callback.message.message_id == Requests.group_message_id). Уведомляет клиента и правит карточку
-# только выигравший переход; проигравший (повтор, позднее или гоночное нажатие) лишь приводит кнопки
-# к актуальному статусу и получает answer.
+# Кнопки под карточкой заявки (Bid) в теме клиента: «Принято в работу» (new → in_progress) и «Готово»
+# (in_progress → done через подтверждение: первое нажатие статус не меняет, а заменяет кнопку на
+# «уведомить клиента» / «Отмена»). Плюс вопрос «Это готовый разбор?» под документом, отправленным Reply
+# на карточку заявки: «Да» переводит new | in_progress → done. Статус — поле Requests.status, не FSM:
+# переход — атомарный условный UPDATE на requests (transition_request_status). Заявка ищется по карточке
+# (Requests.group_message_id): у кнопок карточки — это само сообщение с кнопкой, у вопроса — card_id из
+# callback_data. Уведомляет клиента и правит карточку только выигравший переход; проигравший (повтор,
+# позднее или гоночное нажатие) лишь приводит карточку к актуальному статусу и получает answer.
 
 ORDER_STALE_TEXT = 'Статус этой заявки уже изменён.'
+ORDER_NOT_FOUND_TEXT = 'Заявка не найдена.'
 ORDER_CLIENT_TEXTS = {
     'in_progress': (
         '🛠 <b>Ваша заявка в работе!</b>\n\n'
@@ -1433,63 +1439,140 @@ ORDER_CLIENT_TEXTS = {
         'Работа по заявке от {date} завершена. Если появятся вопросы — просто воспользуйтесь меню.'
     ),
 }
+ORDER_DONE_CONFIRM_HINT = (
+    '⚠️ Клиент получит сообщение, что разбор готов. '
+    'Нажмите подтверждение только если файл с разбором уже отправлен.'
+)
+
+# Статусы, из которых документ на карточке заявки порождает вопрос «Это готовый разбор?» и из которых
+# «Да» переводит заявку в done (new → done — только этим путём).
+READY_QUESTION_STATUSES = ('new', 'in_progress')
+READY_QUESTION_TEXT = (
+    '📎 Файл отправлен клиенту. Это готовый разбор?\n\n'
+    'Если нажмёте «Да, это разбор», заявка станет «Готово», а клиент получит сообщение «Ваш разбор готов!». '
+    'Если это просто файл (реквизиты, анкета и т. п.) — нажмите «Нет, просто файл».'
+)
+READY_DONE_TEXT = '✅ Заявка отмечена готовой — клиент уведомлён.'
+READY_DONE_NOT_NOTIFIED_TEXT = (
+    '✅ Заявка отмечена готовой, но клиент не получил уведомление (возможно, он заблокировал бота).'
+)
+READY_ALREADY_DONE_TEXT = 'Заявка уже отмечена готовой — повторно клиент не уведомлялся.'
+READY_JUST_FILE_TEXT = '📎 Отмечено: это просто файл.'
 
 
-async def _change_order_status(callback: types.CallbackQuery, bot: Bot, *, from_status: str, to_status: str) -> None:
-    card = callback.message
-    group_id = await get_group_id()
+async def _refresh_order_card(bot: Bot, chat_id: int, card_id: int):
+    """
+    Перерисовывает карточку заявки по ТЕКУЩЕМУ статусу из БД: текст со статусом (без подсказки
+    подтверждения «Готово») и кнопка этого статуса. Возвращает строку заявки или None, если её нет.
+    """
+    current = await get_bid_card_by_group_message_id(card_id)
 
-    if card is None or group_id is None or card.chat.id != group_id:
-        await _drop_stale_buttons(bot, callback)
-        await safe_answer_callback(callback, context=f'кнопка статуса вне рабочей группы admin_id={callback.from_user.id}',
-                                   text='Заявка не найдена.')
-        return
+    if current is None:
+        return None
 
-    changed = await transition_request_status(card.message_id, from_status, to_status)
+    await safe_edit_message_text(
+        bot, chat_id, card_id,
+        context=f'актуализация карточки заявки message_id={card_id}',
+        text=_bid_card_text(current.name, current.birthday, current.text, current.status),
+        reply_markup=get_order_status_markup(current.status)
+    )
+
+    return current
+
+
+async def _apply_order_transition(bot: Bot, chat_id: int, card_id: int, *, from_statuses: tuple[str, ...],
+                                  to_status: str, reply_to: int | None = None) -> bool | None:
+    """
+    Атомарный переход заявки с карточкой card_id из from_statuses в to_status. Только победитель
+    правит карточку и уведомляет клиента (reply_to — сообщение в чате клиента, ответом на которое уйдёт
+    уведомление; если его уже нет, уведомление уходит без ответа). None — переход не выполнен (статус уже
+    другой или заявки нет), иначе True/False — получил ли клиент уведомление.
+    """
+    changed = await transition_request_status(card_id, from_statuses, to_status)
 
     if changed is None:
-        current = await get_bid_card_by_group_message_id(card.message_id)
-
-        if current is None:
-            await _drop_stale_buttons(bot, callback)
-            await safe_answer_callback(callback, context=f'кнопка статуса без заявки message_id={card.message_id}',
-                                       text='Заявка не найдена.')
-            return
-
-        await safe_edit_message_text(
-            bot, card.chat.id, card.message_id,
-            context=f'актуализация карточки заявки message_id={card.message_id}',
-            text=_bid_card_text(current.name, current.birthday, current.text, current.status),
-            reply_markup=get_order_status_markup(current.status)
-        )
-        await safe_answer_callback(callback, context=f'неактуальная кнопка статуса message_id={card.message_id}',
-                                   text=ORDER_STALE_TEXT)
-        return
+        return None
 
     client_id = changed.telegram_id
 
     await safe_edit_message_text(
-        bot, card.chat.id, card.message_id,
+        bot, chat_id, card_id,
         context=f'карточка заявки после смены статуса на {to_status} user_id={client_id}',
         text=_bid_card_text(changed.name, changed.birthday, changed.text, to_status),
         reply_markup=get_order_status_markup(to_status)
     )
 
-    notified = await _notify_client(
+    send_kwargs = {}
+
+    if reply_to is not None:
+        send_kwargs['reply_parameters'] = types.ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+
+    return await _notify_client(
         bot, client_id,
         context=f'уведомление о статусе заказа {to_status} user_id={client_id}',
-        text=ORDER_CLIENT_TEXTS[to_status].format(date=format_client_date(changed.created_at))
+        text=ORDER_CLIENT_TEXTS[to_status].format(date=format_client_date(changed.created_at)),
+        **send_kwargs
     )
 
+
+async def _work_group_message(callback: types.CallbackQuery, bot: Bot) -> types.Message | None:
+    """
+    Сообщение с нажатой кнопкой статуса, если оно в привязанной рабочей группе. Иначе снимает кнопки,
+    отвечает на нажатие и возвращает None.
+    """
+    message = callback.message
+    group_id = await get_group_id()
+
+    if message is None or group_id is None or message.chat.id != group_id:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'кнопка статуса вне рабочей группы admin_id={callback.from_user.id}',
+                                   text=ORDER_NOT_FOUND_TEXT)
+        return None
+
+    return message
+
+
+async def _answer_stale_order_card(callback: types.CallbackQuery, bot: Bot, card: types.Message) -> None:
+    """Неактуальная кнопка карточки: карточка приводится к текущему статусу, нажатие получает answer."""
+    current = await _refresh_order_card(bot, card.chat.id, card.message_id)
+
+    if current is None:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'кнопка статуса без заявки message_id={card.message_id}',
+                                   text=ORDER_NOT_FOUND_TEXT)
+        return
+
+    await safe_answer_callback(callback, context=f'неактуальная кнопка статуса message_id={card.message_id}',
+                               text=ORDER_STALE_TEXT)
+
+
+async def _answer_order_transition(callback: types.CallbackQuery, notified: bool, to_status: str) -> None:
     if notified:
-        await safe_answer_callback(callback, context=f'статус заказа {to_status} user_id={client_id}',
+        await safe_answer_callback(callback, context=f'статус заказа {to_status} admin_id={callback.from_user.id}',
                                    text='Статус обновлён, клиент уведомлён.')
     else:
         await safe_answer_callback(
-            callback, context=f'статус заказа {to_status} без уведомления user_id={client_id}',
+            callback, context=f'статус заказа {to_status} без уведомления admin_id={callback.from_user.id}',
             text='Статус обновлён, но клиент не получил уведомление (возможно, заблокировал бота).',
             show_alert=True
         )
+
+
+async def _change_order_status(callback: types.CallbackQuery, bot: Bot, *, from_statuses: tuple[str, ...],
+                               to_status: str) -> None:
+    card = await _work_group_message(callback, bot)
+
+    if card is None:
+        return
+
+    notified = await _apply_order_transition(bot, card.chat.id, card.message_id,
+                                             from_statuses=from_statuses, to_status=to_status)
+
+    if notified is None:
+        await _answer_stale_order_card(callback, bot, card)
+        return
+
+    await _answer_order_transition(callback, notified, to_status)
 
 
 @router.callback_query(OrderStatusCallback.filter(), F.from_user.id != Config.ADMIN_ID)
@@ -1503,12 +1586,117 @@ async def order_callback_not_admin(callback: types.CallbackQuery):
 
 @router.callback_query(OrderStatusCallback.filter(F.action == 'accept'), F.from_user.id == Config.ADMIN_ID)
 async def order_accept(callback: types.CallbackQuery, bot: Bot):
-    await _change_order_status(callback, bot, from_status='new', to_status='in_progress')
+    await _change_order_status(callback, bot, from_statuses=('new',), to_status='in_progress')
 
 
 @router.callback_query(OrderStatusCallback.filter(F.action == 'done'), F.from_user.id == Config.ADMIN_ID)
 async def order_done(callback: types.CallbackQuery, bot: Bot):
-    await _change_order_status(callback, bot, from_status='in_progress', to_status='done')
+    """Первое нажатие «Готово»: статус не меняется, в in_progress кнопка заменяется подтверждением."""
+    card = await _work_group_message(callback, bot)
+
+    if card is None:
+        return
+
+    current = await get_bid_card_by_group_message_id(card.message_id)
+
+    if current is None or current.status != 'in_progress':
+        await _answer_stale_order_card(callback, bot, card)
+        return
+
+    await safe_edit_message_text(
+        bot, card.chat.id, card.message_id,
+        context=f'подтверждение «Готово» на карточке message_id={card.message_id}',
+        text=_bid_card_text(current.name, current.birthday, current.text, current.status, ORDER_DONE_CONFIRM_HINT),
+        reply_markup=get_order_done_confirm_markup()
+    )
+    await safe_answer_callback(callback, context=f'запрос подтверждения «Готово» message_id={card.message_id}')
+
+
+@router.callback_query(OrderStatusCallback.filter(F.action == 'confirm'), F.from_user.id == Config.ADMIN_ID)
+async def order_done_confirm(callback: types.CallbackQuery, bot: Bot):
+    await _change_order_status(callback, bot, from_statuses=('in_progress',), to_status='done')
+
+
+@router.callback_query(OrderStatusCallback.filter(F.action == 'cancel'), F.from_user.id == Config.ADMIN_ID)
+async def order_done_cancel(callback: types.CallbackQuery, bot: Bot):
+    card = await _work_group_message(callback, bot)
+
+    if card is None:
+        return
+
+    current = await _refresh_order_card(bot, card.chat.id, card.message_id)
+
+    if current is None:
+        await _drop_stale_buttons(bot, callback)
+        await safe_answer_callback(callback, context=f'отмена «Готово» без заявки message_id={card.message_id}',
+                                   text=ORDER_NOT_FOUND_TEXT)
+        return
+
+    await safe_answer_callback(
+        callback, context=f'отмена «Готово» message_id={card.message_id}',
+        text='Отменено.' if current.status == 'in_progress' else ORDER_STALE_TEXT
+    )
+
+
+@router.callback_query(ReadyCallback.filter(), F.from_user.id != Config.ADMIN_ID)
+async def ready_callback_not_admin(callback: types.CallbackQuery):
+    await safe_answer_callback(
+        callback,
+        context=f'кнопка «Это готовый разбор?» не от админа user_id={callback.from_user.id}',
+        text='Эта кнопка доступна только администратору.', show_alert=True
+    )
+
+
+@router.callback_query(ReadyCallback.filter(F.action == 'yes'), F.from_user.id == Config.ADMIN_ID)
+async def ready_yes(callback: types.CallbackQuery, callback_data: ReadyCallback, bot: Bot):
+    question = await _work_group_message(callback, bot)
+
+    if question is None:
+        return
+
+    card_id = callback_data.card_id
+    notified = await _apply_order_transition(bot, question.chat.id, card_id, from_statuses=READY_QUESTION_STATUSES,
+                                             to_status='done', reply_to=callback_data.copy_id)
+
+    if notified is None:
+        current = await _refresh_order_card(bot, question.chat.id, card_id)
+
+        if current is None:
+            await _drop_stale_buttons(bot, callback)
+            await safe_answer_callback(callback, context=f'«Это готовый разбор?» без заявки card_id={card_id}',
+                                       text=ORDER_NOT_FOUND_TEXT)
+            return
+
+        await safe_edit_message_text(
+            bot, question.chat.id, question.message_id,
+            context=f'итог устаревшего «Это готовый разбор?» card_id={card_id}',
+            text=READY_ALREADY_DONE_TEXT, reply_markup=None
+        )
+        await safe_answer_callback(callback, context=f'устаревшее «Да, это разбор» card_id={card_id}',
+                                   text=ORDER_STALE_TEXT)
+        return
+
+    await safe_edit_message_text(
+        bot, question.chat.id, question.message_id,
+        context=f'итог «Это готовый разбор?» card_id={card_id}',
+        text=READY_DONE_TEXT if notified else READY_DONE_NOT_NOTIFIED_TEXT, reply_markup=None
+    )
+    await _answer_order_transition(callback, notified, 'done')
+
+
+@router.callback_query(ReadyCallback.filter(F.action == 'no'), F.from_user.id == Config.ADMIN_ID)
+async def ready_no(callback: types.CallbackQuery, callback_data: ReadyCallback, bot: Bot):
+    question = await _work_group_message(callback, bot)
+
+    if question is None:
+        return
+
+    await safe_edit_message_text(
+        bot, question.chat.id, question.message_id,
+        context=f'итог «Нет, просто файл» card_id={callback_data.card_id}',
+        text=READY_JUST_FILE_TEXT, reply_markup=None
+    )
+    await safe_answer_callback(callback, context=f'«Нет, просто файл» card_id={callback_data.card_id}')
 
 
 @router.my_chat_member(ChatMemberUpdatedFilter(IS_NOT_MEMBER >> IS_MEMBER))
@@ -2043,7 +2231,7 @@ async def reply_to_message(message: types.Message, bot: Bot, fsm_storage):
 
     if not message.text and not message.caption:
         fallback_caption = (
-            DOCUMENT_FALLBACK_CAPTION if message.content_type == ContentType.DOCUMENT
+            FILE_FALLBACK_CAPTION if message.content_type == ContentType.DOCUMENT
             else NEUTRAL_FALLBACK_CAPTION
         )
 
@@ -2057,7 +2245,7 @@ async def reply_to_message(message: types.Message, bot: Bot, fsm_storage):
             followup_caption = fallback_caption
 
     try:
-        await message.copy_to(chat_id=user_id, **copy_kwargs)
+        copied = await message.copy_to(chat_id=user_id, **copy_kwargs)
     except TelegramForbiddenError as error:
         logger.warning("Доставка ответа админа пользователю user_id=%s не удалась (пользователь заблокировал бота): %s", user_id, error)
         await safe_answer(message, context=f'уведомление о блокировке (содержимое) admin_id={message.from_user.id}',
@@ -2085,6 +2273,18 @@ async def reply_to_message(message: types.Message, bot: Bot, fsm_storage):
             bot, user_id,
             context=f'подпись к содержимому без caption user_id={user_id}',
             text=followup_caption
+        )
+
+    # Файл уже у клиента; документ в ответ на карточку незакрытой заявки может быть самим разбором —
+    # спрашиваем админа, отметить ли заявку готовой (см. ready_yes). Данные для кнопок — в callback_data.
+    if (message.content_type == ContentType.DOCUMENT and reply_target.type == 'Bid'
+            and reply_target.status in READY_QUESTION_STATUSES):
+        await safe_answer(
+            message,
+            context=f'вопрос «Это готовый разбор?» user_id={user_id}',
+            text=READY_QUESTION_TEXT,
+            reply_parameters=types.ReplyParameters(message_id=message.message_id, allow_sending_without_reply=True),
+            reply_markup=get_ready_question_markup(card_id=original_message.message_id, copy_id=copied.message_id)
         )
 
     await _open_reply_window(bot, fsm_storage, user_id)

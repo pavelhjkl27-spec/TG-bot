@@ -1,6 +1,6 @@
 from aiogram import types
 
-from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback, SettingsCallback
+from app.callbacks import DialogCallback, NewsletterCallback, OrderStatusCallback, ReadyCallback, SettingsCallback
 
 
 def get_main_keyboard():
@@ -166,6 +166,41 @@ def get_order_status_markup(status: str):
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [
             types.InlineKeyboardButton(text=text, callback_data=OrderStatusCallback(action=action).pack()),
+        ]
+    ])
+
+    return keyboard
+
+
+def get_order_done_confirm_markup():
+    """Подтверждение «Готово» под карточкой заявки в in_progress (вместо кнопки статуса)."""
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(
+                text='✅ Файл отправлен — уведомить клиента',
+                callback_data=OrderStatusCallback(action='confirm').pack()
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(text='↩️ Отмена', callback_data=OrderStatusCallback(action='cancel').pack()),
+        ]
+    ])
+
+    return keyboard
+
+
+def get_ready_question_markup(card_id: int, copy_id: int):
+    """Кнопки вопроса «Это готовый разбор?» под документом, отправленным Reply на карточку заявки."""
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(
+                text='✅ Да, это разбор',
+                callback_data=ReadyCallback(action='yes', card_id=card_id, copy_id=copy_id).pack()
+            ),
+            types.InlineKeyboardButton(
+                text='Нет, просто файл',
+                callback_data=ReadyCallback(action='no', card_id=card_id, copy_id=copy_id).pack()
+            ),
         ]
     ])
 

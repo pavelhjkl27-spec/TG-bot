@@ -85,12 +85,13 @@ async def save_user_appeal(user_id, message, appeal_type, name=None, birthday=No
 
 async def get_reply_target_by_group_message_id(group_message_id):
     """
-    Обращение клиента, чья карточка в группе имеет этот message_id: строка (text, telegram_id)
-    или None. None означает, что цитируемое сообщение бота — не карточка заявки/вопроса
-    (служебное сообщение, корень темы, карточка без сохранённого group_message_id).
+    Обращение клиента, чья карточка в группе имеет этот message_id: строка
+    (text, telegram_id, type, status) или None. None означает, что цитируемое сообщение бота —
+    не карточка заявки/вопроса (служебное сообщение, корень темы, карточка без сохранённого
+    group_message_id). type — 'Bid' | 'Question'; status — статус заказа (у вопросов всегда 'new').
     """
     query = (
-        select(Requests.text, Users.telegram_id)
+        select(Requests.text, Users.telegram_id, Requests.type, Requests.status)
         .join(Users, Users.id == Requests.user_id)
         .where(Requests.group_message_id == group_message_id)
     )
@@ -127,10 +128,10 @@ async def get_bid_history_by_thread_id(thread_id):
         return result.all()
 
 
-async def transition_request_status(group_message_id, from_status, to_status):
+async def transition_request_status(group_message_id, from_statuses, to_status):
     """
     Атомарный CAS статуса заказа прямо на requests (не FSM): UPDATE ... WHERE group_message_id = ?
-    AND status = from_status. Конкурентный UPDATE той же строки ждёт коммита первого, перепроверяет
+    AND status IN from_statuses. Конкурентный UPDATE той же строки ждёт коммита первого, перепроверяет
     status и обновляет 0 строк. Данные для карточки и клиента берутся тем же выражением (RETURNING),
     в той же транзакции. Возвращает строку (name, birthday, text, created_at, telegram_id), если
     обновилась ровно одна заявка, иначе None (статус уже не тот или такой карточки нет).
@@ -139,7 +140,7 @@ async def transition_request_status(group_message_id, from_status, to_status):
         update(Requests)
         .where(Requests.group_message_id == group_message_id,
                Requests.type == 'Bid',
-               Requests.status == from_status,
+               Requests.status.in_(from_statuses),
                Users.id == Requests.user_id)
         .values(status=to_status)
         .returning(Requests.name, Requests.birthday, Requests.text, Requests.created_at, Users.telegram_id)
